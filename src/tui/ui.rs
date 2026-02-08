@@ -1,0 +1,772 @@
+use ratatui::{
+    buffer::Buffer,
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style, Stylize},
+    text::{Line, Span},
+    widgets::Paragraph,
+    Frame,
+};
+
+use crate::flamegraph::{cursor_frame_rect, get_zoom_node, layout_frames};
+use super::state::State;
+
+const BG: Color = Color::Rgb(16, 16, 22);
+const ACCENT: Color = Color::Rgb(59, 130, 246);
+const DIM: Color = Color::Rgb(70, 70, 85);
+const BRIGHT: Color = Color::Rgb(220, 220, 235);
+const SEP_COLOR: Color = Color::Rgb(35, 35, 45);
+
+pub fn render(state: &mut State, frame: &mut Frame) {
+    let area = frame.area();
+
+    if state.flamegraph.root.total_value == 0 {
+        render_waiting(frame, area);
+        return;
+    }
+
+    let chunks = Layout::new(
+        Direction::Vertical,
+        [
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ],
+    )
+    .split(area);
+
+    render_header(state, frame, chunks[0]);
+    render_detail_bar(state, frame, chunks[1]);
+    render_flamegraph(state, frame, chunks[2]);
+    render_footer(state, frame, chunks[3]);
+
+    if state.search_active {
+        render_search_overlay(state, frame, chunks[2]);
+    }
+}
+
+fn render_waiting(frame: &mut Frame, area: Rect) {
+    let buf = frame.buffer_mut();
+    fill(buf, area, BG);
+
+    let art: &[&str] = &[
+        " ███████╗██████╗ ██████╗  ██████╗ ███████╗██╗██╗     ███████╗██████╗       ████████╗██╗   ██╗██╗",
+        " ██╔════╝██╔══██╗██╔══██╗██╔═══██╗██╔════╝██║██║     ██╔════╝██╔══██╗      ╚══██╔══╝██║   ██║██║",
+        " █████╗  ██████╔╝██████╔╝██║   ██║█████╗  ██║██║     █████╗  ██████╔╝█████╗   ██║   ██║   ██║██║",
+        " ██╔══╝  ██╔═══╝ ██╔══██╗██║   ██║██╔══╝  ██║██║     ██╔══╝  ██╔══██╗╚════╝   ██║   ██║   ██║██║",
+        " ███████╗██║     ██║  ██║╚██████╔╝██║     ██║███████╗███████╗██║  ██║         ██║   ╚██████╔╝██║",
+        " ╚══════╝╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝     ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝         ╚═╝    ╚═════╝ ╚═╝",
+    ];
+
+    let art_h = art.len() as u16;
+    let art_w = art.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
+
+    let subtitle = "OTLP Profile Flamegraph Viewer";
+    let listening = "Listening on 0.0.0.0:4317";
+    let waiting = "Waiting for profiles...";
+
+    let total_h = art_h + 5;
+    let v_off = area.height.saturating_sub(total_h) / 2;
+
+    let flame_gradient: &[Color] = &[
+        Color::Rgb(168, 50, 160),
+        Color::Rgb(200, 40, 80),
+        Color::Rgb(220, 50, 32),
+        Color::Rgb(240, 100, 18),
+        Color::Rgb(250, 170, 30),
+        Color::Rgb(253, 224, 71),
+    ];
+
+    if area.width >= art_w + 2 && area.height >= total_h {
+        let h_off = (area.width.saturating_sub(art_w)) / 2;
+        for (i, line) in art.iter().enumerate() {
+            let color = flame_gradient[i % flame_gradient.len()];
+            buf.set_string(
+                area.x + h_off,
+                area.y + v_off + i as u16,
+                line,
+                Style::default().fg(color).bg(BG),
+            );
+        }
+    } else {
+        let name = "◆ eprofiler-tui";
+        let hx = area.x + (area.width.saturating_sub(name.len() as u16)) / 2;
+        buf.set_string(
+            hx,
+            area.y + v_off + 1,
+            name,
+            Style::default()
+                .fg(Color::Rgb(250, 170, 30))
+                .bg(BG)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+
+    let base_y = area.y + v_off + art_h + 1;
+
+    center_str(
+        buf,
+        area,
+        base_y,
+        subtitle,
+        Style::default()
+            .fg(BRIGHT)
+            .bg(BG)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let sep_len = subtitle.len() as u16;
+    let sep_x = area.x + (area.width.saturating_sub(sep_len)) / 2;
+    buf.set_string(
+        sep_x,
+        base_y + 1,
+        &"─".repeat(sep_len as usize),
+        Style::default().fg(SEP_COLOR).bg(BG),
+    );
+
+    center_str(
+        buf,
+        area,
+        base_y + 2,
+        listening,
+        Style::default().fg(Color::Rgb(130, 130, 150)).bg(BG),
+    );
+    center_str(
+        buf,
+        area,
+        base_y + 3,
+        waiting,
+        Style::default()
+            .fg(DIM)
+            .bg(BG)
+            .add_modifier(Modifier::ITALIC),
+    );
+}
+
+fn center_str(buf: &mut Buffer, area: Rect, y: u16, text: &str, style: Style) {
+    if y >= area.y + area.height {
+        return;
+    }
+    let x = area.x + (area.width.saturating_sub(text.len() as u16)) / 2;
+    buf.set_string(x, y, text, style);
+}
+
+fn render_header(state: &State, frame: &mut Frame, area: Rect) {
+    let rows = Layout::new(
+        Direction::Vertical,
+        [Constraint::Length(1), Constraint::Length(1)],
+    )
+    .split(area);
+
+    let sep = " │ ".fg(Color::Rgb(55, 55, 65));
+
+    let left_spans: Vec<Span> = vec![
+        Span::styled(" ◆ ", Style::default().fg(ACCENT)),
+        Span::styled(
+            "eprofiler-tui",
+            Style::default()
+                .fg(BRIGHT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        sep.clone(),
+        Span::styled("0.0.0.0:4317", Style::default().fg(Color::Rgb(130, 130, 150))),
+        sep.clone(),
+        format!("{} profiles", state.profiles_received).fg(Color::Rgb(110, 110, 130)),
+        sep,
+        format!("{} samples", format_count(state.samples_received)).fg(Color::Rgb(110, 110, 130)),
+    ];
+    frame.render_widget(Paragraph::new(Line::from(left_spans)), rows[0]);
+
+    let buf = frame.buffer_mut();
+    for x in area.x..area.x + area.width {
+        if let Some(c) = buf.cell_mut((x, rows[1].y)) {
+            c.set_char('─');
+            c.set_style(Style::default().fg(SEP_COLOR));
+        }
+    }
+
+    if !state.zoom_path.is_empty() {
+        let zoom_label = format!(
+            " zoomed: {} ",
+            state.zoom_path.last().unwrap_or(&String::new())
+        );
+        buf.set_string(
+            area.x + 2,
+            rows[1].y,
+            &zoom_label,
+            Style::default()
+                .fg(ACCENT)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+}
+
+fn render_detail_bar(state: &State, frame: &mut Frame, area: Rect) {
+    if state.selected_name.is_empty() {
+        return;
+    }
+    let sep = " │ ".fg(Color::Rgb(55, 55, 65));
+    let root_total = {
+        let zr = get_zoom_node(&state.flamegraph.root, &state.zoom_path);
+        zr.total_value
+    };
+
+    let self_pct = if root_total > 0 {
+        state.selected_self as f64 / root_total as f64 * 100.0
+    } else {
+        0.0
+    };
+    let total_pct = if root_total > 0 {
+        state.selected_total as f64 / root_total as f64 * 100.0
+    } else {
+        0.0
+    };
+
+    let spans: Vec<Span> = vec![
+        " ▸ ".fg(ACCENT).bold(),
+        Span::styled(
+            truncate(&state.selected_name, 40),
+            Style::default().fg(BRIGHT).add_modifier(Modifier::BOLD),
+        ),
+        sep.clone(),
+        "self: ".fg(DIM),
+        format!("{} ({:.1}%)", format_count(state.selected_self as u64), self_pct)
+            .fg(Color::Rgb(249, 115, 22)),
+        sep.clone(),
+        "total: ".fg(DIM),
+        format!(
+            "{} ({:.1}%)",
+            format_count(state.selected_total as u64),
+            total_pct
+        )
+        .fg(Color::Rgb(234, 179, 8)),
+        sep,
+        "depth: ".fg(DIM),
+        state.selected_depth.to_string().fg(Color::Rgb(130, 130, 150)),
+        " ".into(),
+    ];
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn render_flamegraph(state: &mut State, frame: &mut Frame, area: Rect) {
+    let buf = frame.buffer_mut();
+
+    if area.width < 4 || area.height < 2 {
+        return;
+    }
+
+    let zoom_root = get_zoom_node(&state.flamegraph.root, &state.zoom_path);
+    if zoom_root.total_value <= 0 {
+        render_empty_fg(buf, area);
+        return;
+    }
+
+    let frames = layout_frames(zoom_root, area.width);
+    let max_depth = frames.iter().map(|f| f.depth).max().unwrap_or(0);
+    let viewport_height = area.height as usize;
+    let root_total = zoom_root.total_value;
+
+    let cursor_depth = state.cursor_path.len();
+    if viewport_height > 0 {
+        if cursor_depth < state.scroll_y {
+            state.scroll_y = cursor_depth;
+        }
+        if cursor_depth >= state.scroll_y + viewport_height {
+            state.scroll_y = cursor_depth - viewport_height + 1;
+        }
+    }
+    let max_scroll = max_depth.saturating_sub(viewport_height.saturating_sub(1));
+    if state.scroll_y > max_scroll {
+        state.scroll_y = max_scroll;
+    }
+
+    let cursor_rect = cursor_frame_rect(zoom_root, &state.cursor_path, area.width);
+
+    if let Some(ref cr) = cursor_rect {
+        state.selected_name = cr.name.clone();
+        state.selected_self = cr.self_value;
+        state.selected_total = cr.total_value;
+        state.selected_pct = if root_total > 0 {
+            cr.total_value as f64 / root_total as f64 * 100.0
+        } else {
+            0.0
+        };
+        state.selected_depth = cr.depth;
+    }
+
+    for fr in &frames {
+        if fr.depth < state.scroll_y {
+            continue;
+        }
+        let vis_depth = fr.depth - state.scroll_y;
+        if vis_depth >= viewport_height {
+            continue;
+        }
+
+        let screen_y = area.y + vis_depth as u16;
+        if screen_y >= area.y + area.height {
+            continue;
+        }
+
+        let is_cursor = cursor_rect
+            .as_ref()
+            .is_some_and(|cr| cr.depth == fr.depth && cr.x == fr.x);
+
+        let heat = if fr.total_value > 0 {
+            fr.self_value as f64 / fr.total_value as f64
+        } else {
+            0.0
+        };
+
+        let bg = if is_cursor {
+            lighten(flame_color(&fr.name, heat), 45)
+        } else {
+            flame_color(&fr.name, heat)
+        };
+        let fg = contrast_fg(bg);
+
+        let x_start = area.x + fr.x;
+        let x_end = (area.x + fr.x + fr.width).min(area.x + area.width);
+        let border_color = darken(bg, 55);
+
+        for x in x_start..x_end {
+            if let Some(cell) = buf.cell_mut((x, screen_y)) {
+                if x == x_start || x == x_end.saturating_sub(1) {
+                    cell.set_char('▏');
+                    cell.set_style(Style::default().fg(border_color).bg(bg));
+                } else {
+                    cell.set_char(' ');
+                    cell.set_style(Style::default().bg(bg));
+                }
+            }
+        }
+
+        let inner_width = fr.width.saturating_sub(2);
+        if inner_width >= 3 {
+            let max_chars = inner_width as usize;
+            let name = truncate(&fr.name, max_chars);
+            let pad = (inner_width as usize).saturating_sub(name.len()) / 2;
+            let name_x = area.x + fr.x + 1 + pad as u16;
+
+            let style = if is_cursor {
+                Style::default()
+                    .fg(fg)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(fg).bg(bg)
+            };
+            buf.set_string(name_x, screen_y, &name, style);
+        }
+
+        if fr.width >= 14 && root_total > 0 {
+            let pct = fr.total_value as f64 / root_total as f64 * 100.0;
+            if pct >= 0.1 {
+                let pct_str = format!("{:.1}%", pct);
+                let pct_x = area.x + fr.x + fr.width - pct_str.len() as u16 - 2;
+                if pct_x > area.x + fr.x + 2 {
+                    let dim_fg = blend(fg, bg, 0.45);
+                    buf.set_string(pct_x, screen_y, &pct_str, Style::default().fg(dim_fg).bg(bg));
+                }
+            }
+        }
+
+        if is_cursor && fr.width >= 3 {
+            if let Some(cell) = buf.cell_mut((area.x + fr.x + 1, screen_y)) {
+                cell.set_char('▸');
+                cell.set_style(
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD),
+                );
+            }
+        }
+    }
+
+    for vis_d in 0..viewport_height {
+        let screen_y = area.y + vis_d as u16;
+        if screen_y >= area.y + area.height {
+            break;
+        }
+        let depth = state.scroll_y + vis_d;
+        let has_frame = frames.iter().any(|f| f.depth == depth);
+        if !has_frame && depth <= max_depth {
+            for x in area.x..area.x + area.width {
+                if let Some(cell) = buf.cell_mut((x, screen_y)) {
+                    cell.set_char('·');
+                    cell.set_style(Style::default().fg(Color::Rgb(30, 30, 38)));
+                }
+            }
+        }
+    }
+}
+
+fn render_empty_fg(buf: &mut Buffer, area: Rect) {
+    let msg = "No profile data yet";
+    let y = area.y + area.height / 2;
+    let x = area.x + (area.width.saturating_sub(msg.len() as u16)) / 2;
+    buf.set_string(
+        x,
+        y,
+        msg,
+        Style::default()
+            .fg(Color::Rgb(90, 90, 110))
+            .add_modifier(Modifier::ITALIC),
+    );
+}
+
+fn render_footer(state: &State, frame: &mut Frame, area: Rect) {
+    let key = Color::Rgb(80, 80, 100);
+    let desc = Color::Rgb(55, 55, 65);
+
+    if state.search_active {
+        let spans: Vec<Span> = vec![
+            " [Esc]".fg(key),
+            " cancel ".fg(desc),
+            "[Enter]".fg(key),
+            " select ".fg(desc),
+            "[↑↓]".fg(key),
+            " navigate ".fg(desc),
+        ];
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).alignment(Alignment::Left),
+            area,
+        );
+    } else {
+        let spans: Vec<Span> = vec![
+            " [q]".fg(key),
+            " quit ".fg(desc),
+            "[j/↓ k/↑]".fg(key),
+            " depth ".fg(desc),
+            "[h/← l/→]".fg(key),
+            " frame ".fg(desc),
+            "[Enter]".fg(key),
+            " zoom ".fg(desc),
+            "[Esc]".fg(key),
+            " back ".fg(desc),
+            "[/]".fg(key),
+            " search ".fg(desc),
+            "[r]".fg(key),
+            " reset ".fg(desc),
+            "[c]".fg(key),
+            " clear ".fg(desc),
+        ];
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).alignment(Alignment::Left),
+            area,
+        );
+    }
+}
+
+fn render_search_overlay(state: &State, frame: &mut Frame, area: Rect) {
+    let buf = frame.buffer_mut();
+
+    let popup_w = 50u16.min(area.width.saturating_sub(4));
+    if popup_w < 10 {
+        return;
+    }
+
+    let max_visible = 3usize;
+    let match_count = state.search_matches.len().min(max_visible);
+    let popup_h = (match_count as u16 + 4).min(area.height.saturating_sub(2));
+    if popup_h < 4 {
+        return;
+    }
+
+    let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
+    let popup_y = area.y + area.height.saturating_sub(popup_h);
+
+    let popup = Rect::new(popup_x, popup_y, popup_w, popup_h);
+
+    let border_fg = Color::Rgb(245, 166, 35);
+    let input_fg = BRIGHT;
+    let match_fg = Color::Rgb(180, 180, 195);
+    let highlight_bg = Color::Rgb(40, 45, 65);
+    let dim_fg = Color::Rgb(80, 80, 100);
+
+    for y in popup.y..popup.y + popup.height {
+        for x in popup.x..popup.x + popup.width {
+            if let Some(c) = buf.cell_mut((x, y)) {
+                c.set_char(' ');
+                c.set_style(Style::reset());
+            }
+        }
+    }
+
+    let top_y = popup.y;
+    for x in popup.x..popup.x + popup.width {
+        if let Some(c) = buf.cell_mut((x, top_y)) {
+            let ch = if x == popup.x {
+                '╭'
+            } else if x == popup.x + popup.width - 1 {
+                '╮'
+            } else {
+                '─'
+            };
+            c.set_char(ch);
+            c.set_style(Style::reset().fg(border_fg));
+        }
+    }
+
+    let title = " 🔍 thread.name ";
+    let title_x = popup.x + 2;
+    if title.len() + 3 <= popup.width as usize {
+        buf.set_string(
+            title_x,
+            top_y,
+            title,
+            Style::reset()
+                .fg(BRIGHT)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+
+    let bot_y = popup.y + popup.height - 1;
+    for x in popup.x..popup.x + popup.width {
+        if let Some(c) = buf.cell_mut((x, bot_y)) {
+            let ch = if x == popup.x {
+                '╰'
+            } else if x == popup.x + popup.width - 1 {
+                '╯'
+            } else {
+                '─'
+            };
+            c.set_char(ch);
+            c.set_style(Style::reset().fg(border_fg));
+        }
+    }
+
+    for y in (popup.y + 1)..bot_y {
+        if let Some(c) = buf.cell_mut((popup.x, y)) {
+            c.set_char('│');
+            c.set_style(Style::reset().fg(border_fg));
+        }
+        if let Some(c) = buf.cell_mut((popup.x + popup.width - 1, y)) {
+            c.set_char('│');
+            c.set_style(Style::reset().fg(border_fg));
+        }
+    }
+
+    let input_y = popup.y + 1;
+    let inner_w = popup.width.saturating_sub(2) as usize;
+    let prompt = format!(
+        " / {}█",
+        truncate(&state.search_input, inner_w.saturating_sub(5))
+    );
+    buf.set_string(
+        popup.x + 1,
+        input_y,
+        &truncate(&prompt, inner_w),
+        Style::reset().fg(input_fg),
+    );
+
+    let sep_y = popup.y + 2;
+    for x in (popup.x + 1)..(popup.x + popup.width - 1) {
+        if let Some(c) = buf.cell_mut((x, sep_y)) {
+            c.set_char('─');
+            c.set_style(Style::reset().fg(Color::Rgb(60, 60, 75)));
+        }
+    }
+
+    let list_start_y = popup.y + 3;
+    let visible = match_count.min((popup.height.saturating_sub(4)) as usize);
+
+    let scroll_off = if state.search_cursor >= visible {
+        state.search_cursor - visible + 1
+    } else {
+        0
+    };
+
+    if state.search_matches.is_empty() {
+        let msg = if state.search_input.is_empty() {
+            "type to filter threads..."
+        } else {
+            "no matches"
+        };
+        buf.set_string(
+            popup.x + 2,
+            list_start_y,
+            msg,
+            Style::reset()
+                .fg(dim_fg)
+                .add_modifier(Modifier::ITALIC),
+        );
+    } else {
+        for i in 0..visible {
+            let match_idx = scroll_off + i;
+            if match_idx >= state.search_matches.len() {
+                break;
+            }
+            let (ref name, _) = state.search_matches[match_idx];
+            let y = list_start_y + i as u16;
+            let is_selected = match_idx == state.search_cursor;
+
+            let row_fg = if is_selected { BRIGHT } else { match_fg };
+
+            if is_selected {
+                for x in (popup.x + 1)..(popup.x + popup.width - 1) {
+                    if let Some(c) = buf.cell_mut((x, y)) {
+                        c.set_char(' ');
+                        c.set_style(Style::reset().bg(highlight_bg));
+                    }
+                }
+            }
+
+            let prefix = if is_selected { " ▸ " } else { "   " };
+            let display = format!(
+                "{}{}",
+                prefix,
+                truncate(name, inner_w.saturating_sub(3))
+            );
+
+            let style = if is_selected {
+                Style::reset()
+                    .fg(row_fg)
+                    .bg(highlight_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::reset().fg(row_fg)
+            };
+
+            buf.set_string(popup.x + 1, y, &display, style);
+        }
+    }
+}
+
+fn flame_color(name: &str, heat: f64) -> Color {
+    let hash = name
+        .bytes()
+        .fold(0u64, |h, b| h.wrapping_mul(2654435761).wrapping_add(b as u64));
+
+    let h = heat.clamp(0.0, 1.0);
+
+    let (r, g, b) = gradient(
+        h,
+        &[
+            (0.00, (253, 224, 71)),
+            (0.25, (251, 191, 36)),
+            (0.45, (249, 115, 22)),
+            (0.65, (234, 88, 12)),
+            (0.80, (220, 38, 38)),
+            (1.00, (185, 28, 28)),
+        ],
+    );
+
+    let rv = ((hash % 18) as i16 - 9).clamp(-12, 12);
+    let gv = (((hash >> 5) % 14) as i16 - 7).clamp(-10, 10);
+
+    Color::Rgb(
+        (r as i16 + rv).clamp(25, 255) as u8,
+        (g as i16 + gv).clamp(20, 255) as u8,
+        b,
+    )
+}
+
+fn gradient(t: f64, stops: &[(f64, (u8, u8, u8))]) -> (u8, u8, u8) {
+    let t = t.clamp(0.0, 1.0);
+    for i in 0..stops.len() - 1 {
+        let (t0, c0) = stops[i];
+        let (t1, c1) = stops[i + 1];
+        if t <= t1 {
+            let s = if (t1 - t0).abs() < f64::EPSILON {
+                0.0
+            } else {
+                (t - t0) / (t1 - t0)
+            };
+            return (
+                lerp_u8(c0.0, c1.0, s),
+                lerp_u8(c0.1, c1.1, s),
+                lerp_u8(c0.2, c1.2, s),
+            );
+        }
+    }
+    stops.last().unwrap().1
+}
+
+fn lerp_u8(a: u8, b: u8, t: f64) -> u8 {
+    ((1.0 - t) * a as f64 + t * b as f64).round() as u8
+}
+
+fn contrast_fg(bg: Color) -> Color {
+    match bg {
+        Color::Rgb(r, g, b) => {
+            let lum = 0.299 * r as f64 + 0.587 * g as f64 + 0.114 * b as f64;
+            if lum > 160.0 {
+                Color::Rgb(20, 18, 15)
+            } else {
+                Color::Rgb(250, 248, 245)
+            }
+        }
+        _ => Color::White,
+    }
+}
+
+fn lighten(c: Color, amount: u8) -> Color {
+    match c {
+        Color::Rgb(r, g, b) => Color::Rgb(
+            r.saturating_add(amount),
+            g.saturating_add(amount),
+            b.saturating_add(amount),
+        ),
+        _ => c,
+    }
+}
+
+fn darken(c: Color, amount: u8) -> Color {
+    match c {
+        Color::Rgb(r, g, b) => Color::Rgb(
+            r.saturating_sub(amount),
+            g.saturating_sub(amount),
+            b.saturating_sub(amount),
+        ),
+        _ => c,
+    }
+}
+
+fn blend(c1: Color, c2: Color, t: f64) -> Color {
+    match (c1, c2) {
+        (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) => Color::Rgb(
+            lerp_u8(r1, r2, t),
+            lerp_u8(g1, g2, t),
+            lerp_u8(b1, b2, t),
+        ),
+        _ => c1,
+    }
+}
+
+fn fill(buf: &mut Buffer, r: Rect, color: Color) {
+    let style = Style::reset().bg(color);
+    for y in r.y..r.y + r.height {
+        for x in r.x..r.x + r.width {
+            if let Some(c) = buf.cell_mut((x, y)) {
+                c.set_char(' ');
+                c.set_style(style);
+            }
+        }
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else if max <= 1 {
+        s.chars().take(max).collect()
+    } else {
+        s.chars()
+            .take(max - 1)
+            .chain(std::iter::once('…'))
+            .collect()
+    }
+}
+
+fn format_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
