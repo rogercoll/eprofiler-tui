@@ -4,6 +4,7 @@ use crate::flamegraph::{FlameGraph, FlameNode, get_node, get_zoom_node};
 
 pub struct State {
     pub running: bool,
+    pub listen_addr: String,
     pub flamegraph: FlameGraph,
     pub profiles_received: u64,
     pub samples_received: u64,
@@ -22,9 +23,10 @@ pub struct State {
 }
 
 impl State {
-    pub fn new() -> Self {
+    pub fn new(listen_addr: String) -> Self {
         Self {
             running: true,
+            listen_addr,
             flamegraph: FlameGraph::new(),
             profiles_received: 0,
             samples_received: 0,

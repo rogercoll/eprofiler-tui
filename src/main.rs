@@ -1,3 +1,4 @@
+use clap::Parser;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
@@ -12,14 +13,25 @@ use tui::event::{Event, EventHandler};
 use tui::state::State;
 use tui::Tui;
 
+#[derive(Parser)]
+#[command(about = "Terminal-based OTLP flamegraph viewer")]
+struct Cli {
+    #[arg(short, long, default_value_t = 4317)]
+    port: u16,
+}
+
 fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let listen_addr = format!("0.0.0.0:{}", cli.port);
+
     let events = EventHandler::new(100);
 
     let grpc_tx = events.sender.clone();
+    let addr = listen_addr.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
         rt.block_on(async {
-            if let Err(e) = grpc::start_server(grpc_tx, "0.0.0.0:4317").await {
+            if let Err(e) = grpc::start_server(grpc_tx, &addr).await {
                 eprintln!("gRPC server error: {e}");
             }
         });
@@ -30,7 +42,7 @@ fn main() -> Result<()> {
     let mut tui = Tui::new(terminal, events);
     tui.init()?;
 
-    let mut state = State::new();
+    let mut state = State::new(listen_addr);
 
     while state.running {
         tui.draw(&mut state)?;

@@ -6,7 +6,7 @@ A terminal-based flamegraph viewer that receives profiling data via an OTLP gRPC
 
 ## Features
 
-- OTLP gRPC profiles receiver (listens on `0.0.0.0:4317`)
+- OTLP gRPC profiles receiver (default `0.0.0.0:4317`, configurable via `--port`)
 - Live icicle-style flamegraph with hot/warm color scheme
 - Frame type annotations (`[Native]`, `[Kernel]`, `[JVM]`, etc.)
 - Thread/process grouping via `thread.name` sample attribute
@@ -29,6 +29,17 @@ cargo run --release
 ```
 
 The TUI will start and listen for OTLP profile data on port 4317. Point your OpenTelemetry profiling agent at `localhost:4317`.
+
+To use a different port:
+
+```
+cargo run --release -- --port 4318
+```
+
+| Option | Description |
+|--------|-------------|
+| `-p`, `--port <PORT>` | OTLP gRPC listen port (default: `4317`) |
+| `-h`, `--help` | Print help |
 
 ## Keybindings
 

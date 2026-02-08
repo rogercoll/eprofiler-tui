@@ -20,7 +20,7 @@ pub fn render(state: &mut State, frame: &mut Frame) {
     let area = frame.area();
 
     if state.flamegraph.root.total_value == 0 {
-        render_waiting(frame, area);
+        render_waiting(frame, area, &state.listen_addr);
         return;
     }
 
@@ -45,7 +45,7 @@ pub fn render(state: &mut State, frame: &mut Frame) {
     }
 }
 
-fn render_waiting(frame: &mut Frame, area: Rect) {
+fn render_waiting(frame: &mut Frame, area: Rect, listen_addr: &str) {
     let buf = frame.buffer_mut();
     fill(buf, area, BG);
 
@@ -62,7 +62,7 @@ fn render_waiting(frame: &mut Frame, area: Rect) {
     let art_w = art.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
 
     let subtitle = "OTLP Profile Flamegraph Viewer";
-    let listening = "Listening on 0.0.0.0:4317";
+    let listening = format!("Listening on {listen_addr}");
     let waiting = "Waiting for profiles...";
 
     let total_h = art_h + 5;
@@ -128,7 +128,7 @@ fn render_waiting(frame: &mut Frame, area: Rect) {
         buf,
         area,
         base_y + 2,
-        listening,
+        &listening,
         Style::default().fg(Color::Rgb(130, 130, 150)).bg(BG),
     );
     center_str(
@@ -169,7 +169,7 @@ fn render_header(state: &State, frame: &mut Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         sep.clone(),
-        Span::styled("0.0.0.0:4317", Style::default().fg(Color::Rgb(130, 130, 150))),
+        Span::styled(state.listen_addr.clone(), Style::default().fg(Color::Rgb(130, 130, 150))),
         sep.clone(),
         format!("{} profiles", state.profiles_received).fg(Color::Rgb(110, 110, 130)),
         sep,
