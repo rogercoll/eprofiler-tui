@@ -1,6 +1,6 @@
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
-use ratatui::{backend::Backend, Terminal};
+use ratatui::Terminal;
 use state::State;
 use std::{io, panic};
 
@@ -11,14 +11,16 @@ pub(crate) mod state;
 
 mod ui;
 
+type Backend = CrosstermBackend<io::Stderr>;
+
 #[derive(Debug)]
-pub struct Tui<B: Backend> {
-    terminal: Terminal<B>,
+pub struct Tui {
+    terminal: Terminal<Backend>,
     pub events: event::EventHandler,
 }
 
-impl<B: Backend> Tui<B> {
-    pub fn new(terminal: Terminal<B>, events: event::EventHandler) -> Self {
+impl Tui {
+    pub fn new(terminal: Terminal<Backend>, events: event::EventHandler) -> Self {
         Self { terminal, events }
     }
 

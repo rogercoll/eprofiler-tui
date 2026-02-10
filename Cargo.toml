@@ -2,7 +2,7 @@
 name = "eprofiler-tui"
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license = "Apache-2.0"
 description = "Terminal-based flamegraph viewer that receives profiling data via OTLP gRPC and renders live, interactive flamegraphs"
 homepage = "https://github.com/rogercoll/eprofiler-tui"
 repository = "https://github.com/rogercoll/eprofiler-tui"
@@ -13,14 +13,15 @@ categories = ["command-line-utilities", "visualization", "development-tools::pro
 [dependencies]
 better-panic = "0.3"
 clap = { version = "4.5.57", features = ["derive"] }
-prost = "0.13"
-ratatui = "0.29"
+prost = "0.14"
+ratatui = "0.30"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
-tonic = { version = "0.12", features = ["gzip"] }
+tonic = { version = "0.14", features = ["gzip"] }
+tonic-prost = "0.14"
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-prost-build = "0.14"
 
 [dev-dependencies]
 tokio-stream = { version = "0.1.18", features = ["net"] }
