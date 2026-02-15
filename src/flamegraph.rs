@@ -1,9 +1,12 @@
+use std::collections::HashMap;
+
 #[derive(Clone, Debug)]
 pub struct FlameNode {
     pub name: String,
     pub total_value: i64,
     pub self_value: i64,
     pub children: Vec<FlameNode>,
+    child_index: HashMap<String, usize>,
 }
 
 impl FlameNode {
@@ -13,7 +16,18 @@ impl FlameNode {
             total_value: 0,
             self_value: 0,
             children: Vec::new(),
+            child_index: HashMap::new(),
         }
+    }
+
+    /// O(1) child lookup by name (returns reference).
+    pub fn child_by_name(&self, name: &str) -> Option<&FlameNode> {
+        self.child_index.get(name).map(|&idx| &self.children[idx])
+    }
+
+    /// O(1) positional index of a child by name.
+    pub fn child_position(&self, name: &str) -> Option<usize> {
+        self.child_index.get(name).copied()
     }
 
     pub fn add_stack(&mut self, stack: &[String], value: i64) {
@@ -22,27 +36,26 @@ impl FlameNode {
             self.self_value += value;
             return;
         }
-        let pos = self.children.iter().position(|c| c.name == stack[0]);
-        let child = if let Some(pos) = pos {
-            &mut self.children[pos]
+        let idx = if let Some(&idx) = self.child_index.get(&stack[0]) {
+            idx
         } else {
+            let idx = self.children.len();
             self.children.push(FlameNode::new(stack[0].clone()));
-            self.children.last_mut().unwrap()
+            self.child_index.insert(stack[0].clone(), idx);
+            idx
         };
-        child.add_stack(&stack[1..], value);
+        self.children[idx].add_stack(&stack[1..], value);
     }
 
     pub fn merge(&mut self, other: FlameNode) {
         self.total_value += other.total_value;
         self.self_value += other.self_value;
         for other_child in other.children {
-            let pos = self
-                .children
-                .iter()
-                .position(|c| c.name == other_child.name);
-            if let Some(pos) = pos {
-                self.children[pos].merge(other_child);
+            if let Some(&idx) = self.child_index.get(&other_child.name) {
+                self.children[idx].merge(other_child);
             } else {
+                let idx = self.children.len();
+                self.child_index.insert(other_child.name.clone(), idx);
                 self.children.push(other_child);
             }
         }
@@ -51,8 +64,16 @@ impl FlameNode {
     pub fn sort_recursive(&mut self) {
         self.children
             .sort_by(|a, b| b.total_value.cmp(&a.total_value));
+        self.rebuild_index();
         for child in &mut self.children {
             child.sort_recursive();
+        }
+    }
+
+    fn rebuild_index(&mut self) {
+        self.child_index.clear();
+        for (i, child) in self.children.iter().enumerate() {
+            self.child_index.insert(child.name.clone(), i);
         }
     }
 
@@ -91,7 +112,7 @@ impl FlameGraph {
 pub fn get_zoom_node<'a>(root: &'a FlameNode, zoom_path: &[String]) -> &'a FlameNode {
     let mut node = root;
     for name in zoom_path {
-        if let Some(child) = node.children.iter().find(|c| c.name == *name) {
+        if let Some(child) = node.child_by_name(name) {
             node = child;
         }
     }
@@ -119,10 +140,7 @@ pub struct FrameRect {
 }
 
 pub fn thread_rank(root: &FlameNode, thread_name: &str) -> usize {
-    root.children
-        .iter()
-        .position(|c| c.name == thread_name)
-        .unwrap_or(0)
+    root.child_position(thread_name).unwrap_or(0)
 }
 
 pub fn layout_frames(
