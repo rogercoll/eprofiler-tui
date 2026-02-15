@@ -51,7 +51,7 @@ impl State {
         if self.frozen {
             return;
         }
-        self.flamegraph.root.merge(&new_fg.root);
+        self.flamegraph.root.merge(new_fg.root);
         self.flamegraph.root.sort_recursive();
         self.profiles_received += 1;
         self.samples_received += samples;
@@ -135,9 +135,7 @@ impl State {
             .children
             .iter()
             .enumerate()
-            .filter(|(_, child)| {
-                query.is_empty() || child.name.to_lowercase().contains(&query)
-            })
+            .filter(|(_, child)| query.is_empty() || child.name.to_lowercase().contains(&query))
             .map(|(idx, child)| (child.name.clone(), idx))
             .collect();
     }

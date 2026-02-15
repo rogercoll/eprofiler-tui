@@ -32,10 +32,10 @@ impl FlameNode {
         child.add_stack(&stack[1..], value);
     }
 
-    pub fn merge(&mut self, other: &FlameNode) {
+    pub fn merge(&mut self, other: FlameNode) {
         self.total_value += other.total_value;
         self.self_value += other.self_value;
-        for other_child in &other.children {
+        for other_child in other.children {
             let pos = self
                 .children
                 .iter()
@@ -43,7 +43,7 @@ impl FlameNode {
             if let Some(pos) = pos {
                 self.children[pos].merge(other_child);
             } else {
-                self.children.push(other_child.clone());
+                self.children.push(other_child);
             }
         }
     }
@@ -61,7 +61,12 @@ impl FlameNode {
         if self.children.is_empty() {
             0
         } else {
-            1 + self.children.iter().map(|c| c.max_depth()).max().unwrap_or(0)
+            1 + self
+                .children
+                .iter()
+                .map(|c| c.max_depth())
+                .max()
+                .unwrap_or(0)
         }
     }
 }
@@ -120,7 +125,11 @@ pub fn thread_rank(root: &FlameNode, thread_name: &str) -> usize {
         .unwrap_or(0)
 }
 
-pub fn layout_frames(node: &FlameNode, area_width: u16, forced_palette: Option<usize>) -> Vec<FrameRect> {
+pub fn layout_frames(
+    node: &FlameNode,
+    area_width: u16,
+    forced_palette: Option<usize>,
+) -> Vec<FrameRect> {
     if node.total_value <= 0 {
         return Vec::new();
     }

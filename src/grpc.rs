@@ -2,10 +2,10 @@ use std::sync::mpsc;
 use tonic::{Request, Response, Status};
 
 use crate::flamegraph::FlameGraph;
+use crate::tui::event::Event;
 use eprofiler_proto::opentelemetry::proto::collector::profiles::v1development as collector;
 use eprofiler_proto::opentelemetry::proto::common::v1 as common;
 use eprofiler_proto::opentelemetry::proto::profiles::v1development as profiles;
-use crate::tui::event::Event;
 
 pub struct ProfilesServer {
     event_tx: mpsc::Sender<Event>,
@@ -38,16 +38,16 @@ impl collector::profiles_service_server::ProfilesService for ProfilesServer {
                             continue;
                         }
 
-                        let value = if !sample.values.is_empty() {
-                            sample.values.iter().sum::<i64>().max(1)
-                        } else if !sample.timestamps_unix_nano.is_empty() {
+                        let value = if !sample.timestamps_unix_nano.is_empty() {
                             sample.timestamps_unix_nano.len() as i64
+                        } else if !sample.values.is_empty() {
+                            sample.values.iter().sum::<i64>().max(1)
                         } else {
                             1
                         };
 
                         flamegraph.add_stack(&stack, value);
-                        sample_count += 1;
+                        sample_count += value as u64;
                     }
                 }
             }
@@ -211,10 +211,7 @@ fn format_with_tag(label: &str, tag: &str) -> String {
     }
 }
 
-fn resolve_thread_name(
-    sample: &profiles::Sample,
-    dict: &profiles::ProfilesDictionary,
-) -> String {
+fn resolve_thread_name(sample: &profiles::Sample, dict: &profiles::ProfilesDictionary) -> String {
     for &attr_idx in &sample.attribute_indices {
         let attr_idx = attr_idx as usize;
         if attr_idx == 0 || attr_idx >= dict.attribute_table.len() {
@@ -261,61 +258,32 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    use collector::profiles_service_client::ProfilesServiceClient;
     use collector::ExportProfilesServiceRequest;
-    use common::any_value;
+    use collector::profiles_service_client::ProfilesServiceClient;
     use common::AnyValue;
+    use common::any_value;
     use profiles::{
         Function, KeyValueAndUnit, Line, Location, Profile, ProfilesDictionary, ResourceProfiles,
         Sample, ScopeProfiles, Stack,
     };
 
-    #[tokio::test]
-    async fn test_export_profile() {
-        let (tx, rx) = mpsc::channel();
-
+    async fn setup_server(tx: mpsc::Sender<Event>) -> u16 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-
         tokio::spawn(async move {
             let server = ProfilesServer::new(tx);
             tonic::transport::Server::builder()
-                .add_service(
-                    collector::profiles_service_server::ProfilesServiceServer::new(server),
-                )
+                .add_service(collector::profiles_service_server::ProfilesServiceServer::new(server))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
                 .await
                 .unwrap();
         });
-
         tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let mut client = ProfilesServiceClient::connect(format!("http://127.0.0.1:{port}"))
-            .await
-            .unwrap();
-
-        client.export(build_request()).await.unwrap();
-
-        let event = rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        match event {
-            Event::ProfileUpdate { flamegraph, samples } => {
-                assert_eq!(samples, 1);
-                assert_eq!(flamegraph.root.children.len(), 1);
-
-                let thread = &flamegraph.root.children[0];
-                assert_eq!(thread.name, "worker-1");
-                assert_eq!(thread.total_value, 10);
-
-                let child = &thread.children[0];
-                assert_eq!(child.name, "main");
-                assert_eq!(child.children[0].name, "do_work");
-            }
-            _ => panic!("expected ProfileUpdate event"),
-        }
+        port
     }
 
-    fn build_request() -> ExportProfilesServiceRequest {
-        let dictionary = ProfilesDictionary {
+    fn build_dictionary() -> ProfilesDictionary {
+        ProfilesDictionary {
             string_table: vec![
                 "".into(),
                 "thread.name".into(),
@@ -368,7 +336,17 @@ mod tests {
                 },
             ],
             ..Default::default()
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn test_export_with_values() {
+        let (tx, rx) = mpsc::channel();
+        let port = setup_server(tx).await;
+
+        let mut client = ProfilesServiceClient::connect(format!("http://127.0.0.1:{port}"))
+            .await
+            .unwrap();
 
         let sample = Sample {
             stack_index: 1,
@@ -376,9 +354,8 @@ mod tests {
             attribute_indices: vec![1],
             ..Default::default()
         };
-
-        ExportProfilesServiceRequest {
-            dictionary: Some(dictionary),
+        let req = ExportProfilesServiceRequest {
+            dictionary: Some(build_dictionary()),
             resource_profiles: vec![ResourceProfiles {
                 scope_profiles: vec![ScopeProfiles {
                     profiles: vec![Profile {
@@ -389,6 +366,70 @@ mod tests {
                 }],
                 ..Default::default()
             }],
+        };
+
+        client.export(req).await.unwrap();
+
+        let event = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        match event {
+            Event::ProfileUpdate {
+                flamegraph,
+                samples,
+            } => {
+                assert_eq!(samples, 10);
+                let thread = &flamegraph.root.children[0];
+                assert_eq!(thread.name, "worker-1");
+                assert_eq!(thread.total_value, 10);
+                assert_eq!(thread.children[0].name, "main");
+                assert_eq!(thread.children[0].children[0].name, "do_work");
+            }
+            _ => panic!("expected ProfileUpdate event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_export_timestamps_take_priority() {
+        let (tx, rx) = mpsc::channel();
+        let port = setup_server(tx).await;
+
+        let mut client = ProfilesServiceClient::connect(format!("http://127.0.0.1:{port}"))
+            .await
+            .unwrap();
+
+        let sample = Sample {
+            stack_index: 1,
+            values: vec![1],
+            timestamps_unix_nano: vec![100, 200, 300, 400, 500],
+            attribute_indices: vec![1],
+            ..Default::default()
+        };
+        let req = ExportProfilesServiceRequest {
+            dictionary: Some(build_dictionary()),
+            resource_profiles: vec![ResourceProfiles {
+                scope_profiles: vec![ScopeProfiles {
+                    profiles: vec![Profile {
+                        samples: vec![sample],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        client.export(req).await.unwrap();
+
+        let event = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        match event {
+            Event::ProfileUpdate {
+                flamegraph,
+                samples,
+            } => {
+                assert_eq!(samples, 5);
+                let thread = &flamegraph.root.children[0];
+                assert_eq!(thread.total_value, 5);
+            }
+            _ => panic!("expected ProfileUpdate event"),
         }
     }
 }
