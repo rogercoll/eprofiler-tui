@@ -1,19 +1,23 @@
 use clap::Parser;
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 
 mod error;
 mod flamegraph;
 mod grpc;
+mod symbolizer;
 mod tui;
 
 use error::Result;
+use tui::Tui;
 use tui::event::{Event, EventHandler};
 use tui::state::State;
-use tui::Tui;
 
 #[derive(Parser)]
-#[command(name = "eprofiler-tui", about = "Terminal-based OTLP flamegraph viewer")]
+#[command(
+    name = "eprofiler-tui",
+    about = "Terminal-based OTLP flamegraph viewer"
+)]
 struct Cli {
     #[arg(short, long, default_value_t = 4317)]
     port: u16,
