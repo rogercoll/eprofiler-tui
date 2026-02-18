@@ -5,6 +5,7 @@ use ratatui::backend::CrosstermBackend;
 mod error;
 mod flamegraph;
 mod grpc;
+mod storage;
 mod symbolizer;
 mod tui;
 

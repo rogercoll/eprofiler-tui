@@ -16,4 +16,6 @@ pub enum Error {
     SymMulti(#[from] symblib::symbconv::multi::Error),
     #[error("multi symbolization multi error: {0}")]
     SymConv(#[from] symblib::symbconv::Error),
+    #[error("storage error: {0}")]
+    Storage(#[from] fjall::Error),
 }

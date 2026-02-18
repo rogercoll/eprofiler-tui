@@ -24,6 +24,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 tonic = { version = "0.14", features = ["gzip"] }
 symblib = { version = "*", path = "./opentelemetry-ebpf-profiler/rust-crates/symblib" }
 indexmap = "2.13.0"
+fjall = "2"
+zerocopy = { version = "0.8", features = ["derive"] }
 
 [dev-dependencies]
 tokio-stream = { version = "0.1.18", features = ["net"] }
