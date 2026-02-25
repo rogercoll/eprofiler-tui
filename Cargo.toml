@@ -26,6 +26,7 @@ symblib = { version = "*", path = "./opentelemetry-ebpf-profiler/rust-crates/sym
 indexmap = "2.13.0"
 fjall = "2"
 zerocopy = { version = "0.8", features = ["derive"] }
+directories = "6.0.0"
 
 [dev-dependencies]
 tokio-stream = { version = "0.1.18", features = ["net"] }

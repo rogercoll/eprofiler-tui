@@ -1,13 +1,15 @@
 use ratatui::crossterm::event::{self, Event as CrosstermEvent, KeyEvent, KeyEventKind};
 use std::sync::{
+    Arc,
     atomic::{AtomicBool, Ordering},
-    mpsc, Arc,
+    mpsc,
 };
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::error::Result;
 use crate::flamegraph::FlameGraph;
+use crate::storage::ExecutableInfo;
 
 pub enum Event {
     Tick,
@@ -16,6 +18,15 @@ pub enum Event {
     ProfileUpdate {
         flamegraph: FlameGraph,
         samples: u64,
+    },
+    MappingsDiscovered(Vec<String>),
+    SymbolsLoaded {
+        target_name: String,
+        info: Result<ExecutableInfo>,
+    },
+    SymbolsRemoved {
+        name: String,
+        error: Option<crate::error::Error>,
     },
 }
 

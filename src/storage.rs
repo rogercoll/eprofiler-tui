@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::RwLock;
 
 use fjall::{Keyspace, PartitionHandle};
 use symblib::VirtAddr;
-use symblib::fileid::FileId;
+pub use symblib::fileid::FileId;
 use zerocopy::byteorder::{BigEndian, U16, U32, U64, U128};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
@@ -31,6 +33,14 @@ impl RangeKey {
             depth: U16::new(depth),
         }
     }
+
+    fn va_start(&self) -> u64 {
+        self.va_start.get()
+    }
+
+    fn depth(&self) -> u16 {
+        self.depth.get()
+    }
 }
 
 /// Fixed-size value stored alongside each [`RangeKey`].
@@ -47,8 +57,8 @@ struct RangeValue {
     call_line: U32<BigEndian>,
 }
 
-impl From<&SymRange> for RangeValue {
-    fn from(r: &SymRange) -> Self {
+impl RangeValue {
+    fn from_range(r: &SymRange) -> Self {
         Self {
             length: U32::new(r.length),
             func_ref: U32::new(r.func.0),
@@ -57,9 +67,15 @@ impl From<&SymRange> for RangeValue {
             call_line: U32::new(r.call_line.unwrap_or(0)),
         }
     }
-}
 
-impl RangeValue {
+    fn length(&self) -> u32 {
+        self.length.get()
+    }
+
+    fn func_ref(&self) -> u32 {
+        self.func_ref.get()
+    }
+
     fn file_ref(&self) -> Option<u32> {
         let v = self.file_ref.get();
         (v != NONE_REF).then_some(v)
@@ -96,21 +112,29 @@ impl StringKey {
 /// Resolved symbol information for a single inline depth level.
 pub struct ResolvedFrame {
     pub func: String,
-    pub file: Option<String>,
-    pub call_file: Option<String>,
-    pub call_line: Option<u32>,
     pub depth: u16,
+}
+
+/// Metadata for a stored executable.
+#[derive(Clone)]
+pub struct ExecutableInfo {
+    pub file_id: FileId,
+    pub file_name: String,
+    pub num_ranges: u32,
 }
 
 /// Persistent symbol store backed by fjall (LSM-tree).
 ///
-/// Two partitions:
+/// Three partitions:
 ///   - **ranges**: `RangeKey -> RangeValue` (fixed 26-byte key, 20-byte value)
 ///   - **strings**: `StringKey -> raw UTF-8` (fixed 20-byte key, variable value)
+///   - **files**: `U128<BE> -> num_ranges(4) + filename` (executable metadata)
 pub struct SymbolStore {
     keyspace: Keyspace,
     ranges: PartitionHandle,
     strings: PartitionHandle,
+    files: PartitionHandle,
+    basename_index: RwLock<HashMap<String, FileId>>,
 }
 
 impl SymbolStore {
@@ -118,15 +142,31 @@ impl SymbolStore {
         let keyspace = fjall::Config::new(path).open()?;
         let ranges = keyspace.open_partition("ranges", Default::default())?;
         let strings = keyspace.open_partition("strings", Default::default())?;
-        Ok(Self {
+        let files = keyspace.open_partition("files", Default::default())?;
+
+        let store = Self {
             keyspace,
             ranges,
             strings,
-        })
+            files,
+            basename_index: RwLock::new(HashMap::new()),
+        };
+
+        // Rebuild in-memory basename index from persisted metadata.
+        for info in store.list_files()? {
+            let basename = basename_of(&info.file_name);
+            store
+                .basename_index
+                .write()
+                .unwrap()
+                .insert(basename, info.file_id);
+        }
+
+        Ok(store)
     }
 
-    /// Atomically persist all ranges and interned strings for one binary.
-    pub fn store_file_symbols(&self, file_sym: &FileSym) -> crate::Result<()> {
+    /// Atomically persist all ranges, interned strings, and file metadata.
+    pub fn store_file_symbols(&self, file_sym: &FileSym, path: &Path) -> crate::Result<()> {
         let fid: u128 = file_sym.file_id.into();
         let mut batch = self.keyspace.batch();
 
@@ -137,11 +177,28 @@ impl SymbolStore {
 
         for r in &file_sym.ranges {
             let key = RangeKey::new(fid, r.va_start, r.depth);
-            let val = RangeValue::from(r);
+            let val = RangeValue::from_range(r);
             batch.insert(&self.ranges, key.as_bytes(), val.as_bytes());
         }
 
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let num_ranges = file_sym.ranges.len() as u32;
+        let mut meta_val = num_ranges.to_be_bytes().to_vec();
+        meta_val.extend_from_slice(file_name.as_bytes());
+        let fid_key = U128::<BigEndian>::new(fid);
+        batch.insert(&self.files, fid_key.as_bytes(), &meta_val);
+
         batch.commit()?;
+
+        let bname = basename_of(&file_name);
+        self.basename_index
+            .write()
+            .unwrap()
+            .insert(bname, file_sym.file_id);
+
         Ok(())
     }
 
@@ -166,28 +223,16 @@ impl SymbolStore {
                 continue;
             };
 
-            let start = key.va_start.get();
-            let end = start.saturating_add(val.length.get() as u64);
+            let start = key.va_start();
+            let end = start.saturating_add(val.length() as u64);
 
             if addr >= start && addr < end {
                 frames.push(ResolvedFrame {
-                    func: self.resolve_string(fid, val.func_ref.get())?,
-                    file: val
-                        .file_ref()
-                        .map(|i| self.resolve_string(fid, i))
-                        .transpose()?,
-                    call_file: val
-                        .call_file_ref()
-                        .map(|i| self.resolve_string(fid, i))
-                        .transpose()?,
-                    call_line: val.call_line(),
-                    depth: key.depth.get(),
+                    func: self.resolve_string(fid, val.func_ref())?,
+                    depth: key.depth(),
                 });
-
-                if key.depth.get() == 0 {
-                    break;
-                }
-            } else if key.depth.get() == 0 {
+            }
+            if key.depth() == 0 {
                 break;
             }
         }
@@ -203,4 +248,69 @@ impl SymbolStore {
             None => Ok("[unknown]".into()),
         }
     }
+
+    /// Resolve a mapping basename to a stored FileId.
+    pub fn file_id_for_basename(&self, basename: &str) -> Option<FileId> {
+        self.basename_index
+            .read()
+            .ok()
+            .map(|base| base.get(basename).copied())?
+    }
+
+    /// List all stored executables.
+    pub fn list_files(&self) -> crate::Result<Vec<ExecutableInfo>> {
+        let mut result = Vec::new();
+        for item in self.files.range::<Vec<u8>, _>(..) {
+            let (kb, vb) = item?;
+            if let Some(info) = parse_file_meta(&kb, &vb) {
+                result.push(info);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Remove all stored symbols for a given file.
+    pub fn remove_file_symbols(&self, file_id: FileId) -> crate::Result<()> {
+        let fid: u128 = file_id.into();
+        let prefix = U128::<BigEndian>::new(fid);
+        let prefix_bytes = prefix.as_bytes();
+
+        let mut batch = self.keyspace.batch();
+
+        for item in self.ranges.prefix(prefix_bytes) {
+            let (k, _) = item?;
+            batch.remove(&self.ranges, k);
+        }
+        for item in self.strings.prefix(prefix_bytes) {
+            let (k, _) = item?;
+            batch.remove(&self.strings, k);
+        }
+        batch.remove(&self.files, prefix_bytes);
+        batch.commit()?;
+
+        self.basename_index
+            .write()
+            .unwrap()
+            .retain(|_, v| *v != file_id);
+
+        Ok(())
+    }
+}
+
+fn parse_file_meta(kb: &[u8], vb: &[u8]) -> Option<ExecutableInfo> {
+    let fid_key = U128::<BigEndian>::ref_from_bytes(kb).ok()?;
+    if vb.len() < 4 {
+        return None;
+    }
+    let num_ranges = u32::from_be_bytes(vb[..4].try_into().ok()?);
+    let file_name = String::from_utf8_lossy(&vb[4..]).into_owned();
+    Some(ExecutableInfo {
+        file_id: FileId::from(fid_key.get()),
+        file_name,
+        num_ranges,
+    })
+}
+
+fn basename_of(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_owned()
 }
