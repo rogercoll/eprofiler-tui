@@ -109,7 +109,7 @@ fn main() -> Result<()> {
                     });
                 }
                 Action::RemoveSymbols(name, file_id) => {
-                    state.exe_status = Some(format!("Removing {}", name));
+                    state.exe.status = Some(format!("Removing {}", name));
                     std::thread::spawn({
                         let sender = tui.events.sender.clone();
                         let store = Arc::clone(&store);
@@ -127,32 +127,33 @@ fn main() -> Result<()> {
                 flamegraph,
                 samples,
             } => {
-                state.merge_flamegraph(flamegraph, samples);
+                state.fg.merge(flamegraph, samples);
             }
             Event::MappingsDiscovered(names) => {
-                state.merge_discovered_mappings(names);
+                state.exe.merge_discovered_mappings(names);
             }
             Event::SymbolsLoaded { target_name, info } => {
                 match info {
                     Ok(info) => {
-                        state.exe_status = Some(format!(
+                        state.exe.status = Some(format!(
                             "Loaded {} symbols for {}",
                             info.num_ranges, target_name
                         ));
-                        state.update_symbolized(target_name, info);
+                        state.exe.update_symbolized(target_name, info);
                     }
                     Err(err) => {
-                        state.exe_status = Some(format!("Error loading {}: {}", target_name, err))
+                        state.exe.status =
+                            Some(format!("Error loading {}: {}", target_name, err))
                     }
                 };
             }
             Event::SymbolsRemoved { name, error } => {
-                state.exe_status = Some(
+                state.exe.status = Some(
                     error
                         .map(|err| format!("Error removing {}: {}", name, err))
                         .unwrap_or(format!("Removed symbols for {}", name)),
                 );
-                state.clear_symbols(&name);
+                state.exe.clear_symbols(&name);
             }
         }
     }

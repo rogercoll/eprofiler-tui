@@ -1,8 +1,9 @@
 FROM rust:1.88-slim-bullseye AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends cmake g++ make protobuf-compiler && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
-COPY Cargo.toml Cargo.toml
-COPY Cargo.lock Cargo.lock
+COPY Cargo.toml Cargo.lock ./
 COPY proto/Cargo.toml proto/Cargo.toml
+COPY opentelemetry-ebpf-profiler/ opentelemetry-ebpf-profiler/
 RUN mkdir src/ && echo "fn main() {println!(\"failed to build\")}" > src/main.rs
 RUN mkdir -p proto/src/ && echo "" > proto/src/lib.rs
 RUN cargo build --release

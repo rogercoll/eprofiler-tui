@@ -75,21 +75,6 @@ impl RangeValue {
     fn func_ref(&self) -> u32 {
         self.func_ref.get()
     }
-
-    fn file_ref(&self) -> Option<u32> {
-        let v = self.file_ref.get();
-        (v != NONE_REF).then_some(v)
-    }
-
-    fn call_file_ref(&self) -> Option<u32> {
-        let v = self.call_file_ref.get();
-        (v != NONE_REF).then_some(v)
-    }
-
-    fn call_line(&self) -> Option<u32> {
-        let v = self.call_line.get();
-        (v != 0).then_some(v)
-    }
 }
 
 /// Key for the per-file interned string table.
@@ -171,14 +156,19 @@ impl SymbolStore {
         let mut batch = self.keyspace.batch();
 
         for (idx, s) in file_sym.strings.iter().enumerate() {
-            let key = StringKey::new(fid, idx as u32);
-            batch.insert(&self.strings, key.as_bytes(), s.as_bytes());
+            batch.insert(
+                &self.strings,
+                StringKey::new(fid, idx as u32).as_bytes(),
+                s.as_bytes(),
+            );
         }
 
         for r in &file_sym.ranges {
-            let key = RangeKey::new(fid, r.va_start, r.depth);
-            let val = RangeValue::from_range(r);
-            batch.insert(&self.ranges, key.as_bytes(), val.as_bytes());
+            batch.insert(
+                &self.ranges,
+                RangeKey::new(fid, r.va_start, r.depth).as_bytes(),
+                RangeValue::from_range(r).as_bytes(),
+            );
         }
 
         let file_name = path
@@ -278,12 +268,10 @@ impl SymbolStore {
         let mut batch = self.keyspace.batch();
 
         for item in self.ranges.prefix(prefix_bytes) {
-            let (k, _) = item?;
-            batch.remove(&self.ranges, k);
+            batch.remove(&self.ranges, item?.0);
         }
         for item in self.strings.prefix(prefix_bytes) {
-            let (k, _) = item?;
-            batch.remove(&self.strings, k);
+            batch.remove(&self.strings, item?.0);
         }
         batch.remove(&self.files, prefix_bytes);
         batch.commit()?;
