@@ -20,6 +20,7 @@ A terminal-based flamegraph viewer that receives profiling data via an OTLP gRPC
 - Thread/process grouping via `thread.name` sample attribute
 - Keyboard-driven navigation and zoom
 - Thread search (`/`) with fuzzy filtering
+- **Experimental**: Executables tab — load debug symbols from ELF/DWARF binaries for inline-aware symbolization (persistent LSM-tree store survives restarts)
 
 ![Demo](content/assets/quickstart.gif)
 
@@ -28,7 +29,7 @@ A terminal-based flamegraph viewer that receives profiling data via an OTLP gRPC
 No Rust toolchain required — you can run `eprofiler-tui` directly with Docker or Podman:
 
 ```
-podman run -it -p 4317:4317 ghcr.io/rogercoll/eprofiler-tui:latest
+podman run -it -p 4317:4317 ghcr.io/rogercoll/eprofiler-tui:latest --data-dir /tmp
 ```
 
 > Replace `podman` with `docker` if preferred.
@@ -53,11 +54,18 @@ eprofiler-tui --port 4318
 | Option | Description |
 |--------|-------------|
 | `-p`, `--port <PORT>` | OTLP gRPC listen port (default: `4317`) |
+| `-d`, `--data-dir <PATH>` | Symbol store directory (default: platform data dir) |
 | `-h`, `--help` | Print help |
 
 ## Building
 
 Requires Rust 2024 edition and protobuf definitions from the `opentelemetry-proto` submodule.
+
+The symbolization feature (`symblib`) pulls in native C/C++ dependencies that need extra build tools:
+
+- `cmake` and `make` — used by the `zydis` disassembler crate
+- `g++` (or any C++ compiler) — compiles `zydis`'s bundled C sources
+- `protobuf-compiler` (`protoc`) — used by `prost-build` to compile `.proto` definitions inside `symblib`
 
 ```
 git submodule update --init
@@ -66,15 +74,24 @@ cargo build --release
 
 ## Keybindings
 
+**Global**: `Tab` switch tab, `Ctrl-c` / `q` quit.
+
+**Flamegraph tab**
+
 | Key | Action |
 |-----|--------|
 | `f` / `Space` | Toggle freeze/live mode |
-| `j` / `↓` | Move deeper into the stack |
-| `k` / `↑` | Move shallower |
-| `h` / `←` | Previous sibling frame |
-| `l` / `→` | Next sibling frame |
-| `Enter` | Zoom into selected frame |
-| `Esc` | Zoom out one level |
-| `/` | Search/filter by thread name |
-| `r` | Reset (clear all data) |
-| `q` | Quit |
+| `j` / `↓`  `k` / `↑` | Navigate depth |
+| `h` / `←`  `l` / `→` | Navigate siblings |
+| `Enter` / `Esc` | Zoom in / out |
+| `/` | Search threads |
+| `r` | Reset |
+
+**Executables tab** *(experimental — under testing, may be removed for simplification)*
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` | Navigate list |
+| `Enter` | Load symbols for selected executable |
+| `/` | Add new executable by path |
+| `r` | Remove loaded symbols |

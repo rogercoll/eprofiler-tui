@@ -1,7 +1,9 @@
-use std::sync::mpsc;
+use std::collections::HashSet;
+use std::sync::{Arc, RwLock, mpsc};
 use tonic::{Request, Response, Status};
 
 use crate::flamegraph::FlameGraph;
+use crate::storage::SymbolStore;
 use crate::tui::event::Event;
 use eprofiler_proto::opentelemetry::proto::collector::profiles::v1development as collector;
 use eprofiler_proto::opentelemetry::proto::common::v1 as common;
@@ -9,11 +11,44 @@ use eprofiler_proto::opentelemetry::proto::profiles::v1development as profiles;
 
 pub struct ProfilesServer {
     event_tx: mpsc::Sender<Event>,
+    store: Option<Arc<SymbolStore>>,
+    known_basenames: RwLock<HashSet<String>>,
 }
 
 impl ProfilesServer {
-    pub fn new(event_tx: mpsc::Sender<Event>) -> Self {
-        Self { event_tx }
+    pub fn new(event_tx: mpsc::Sender<Event>, store: Option<Arc<SymbolStore>>) -> Self {
+        Self {
+            event_tx,
+            store,
+            known_basenames: RwLock::new(HashSet::new()),
+        }
+    }
+
+    fn unknown_basenames(&self, dict: &profiles::ProfilesDictionary) -> Vec<String> {
+        dict.mapping_table
+            .iter()
+            .skip(1)
+            .fold(Vec::new(), |mut names, mapping| {
+                let name_idx = mapping.filename_strindex as usize;
+                if name_idx == 0 || name_idx >= dict.string_table.len() {
+                    return names;
+                }
+                let full_path = &dict.string_table[name_idx];
+                // TODO: handle unwrap
+                if !full_path.is_empty()
+                    && !self.known_basenames.read().unwrap().contains(full_path)
+                {
+                    let basename = full_path.rsplit('/').next().unwrap_or(full_path);
+                    if !basename.is_empty() && !basename.starts_with('[') {
+                        self.known_basenames
+                            .write()
+                            .unwrap()
+                            .insert(full_path.to_string());
+                        names.push(basename.to_string());
+                    }
+                }
+                return names;
+            })
     }
 }
 
@@ -33,7 +68,7 @@ impl collector::profiles_service_server::ProfilesService for ProfilesServer {
             for scope_profiles in &resource_profiles.scope_profiles {
                 for profile in &scope_profiles.profiles {
                     for sample in &profile.samples {
-                        let stack = resolve_stack(sample, dict);
+                        let stack = resolve_stack(sample, dict, self.store.as_deref());
                         if stack.is_empty() {
                             continue;
                         }
@@ -55,6 +90,13 @@ impl collector::profiles_service_server::ProfilesService for ProfilesServer {
 
         flamegraph.root.sort_recursive();
 
+        if let Some(dict) = dict {
+            let basenames = self.unknown_basenames(dict);
+            if !basenames.is_empty() {
+                let _ = self.event_tx.send(Event::MappingsDiscovered(basenames));
+            }
+        }
+
         let _ = self.event_tx.send(Event::ProfileUpdate {
             flamegraph,
             samples: sample_count,
@@ -69,6 +111,7 @@ impl collector::profiles_service_server::ProfilesService for ProfilesServer {
 fn resolve_stack(
     sample: &profiles::Sample,
     dict: Option<&profiles::ProfilesDictionary>,
+    store: Option<&SymbolStore>,
 ) -> Vec<String> {
     let Some(dict) = dict else {
         return vec![];
@@ -91,8 +134,24 @@ fn resolve_stack(
         let frame_tag = resolve_frame_type(location, dict);
 
         if location.lines.is_empty() {
-            let label = resolve_unsymbolized_label(location, dict);
-            frames.push(format_with_tag(&label, &frame_tag));
+            let mut symbolized = false;
+
+            if frame_tag == "Native" {
+                if let Some(store) = store {
+                    if let Some(sym_names) = symbolize_native(store, location, dict) {
+                        for (i, name) in sym_names.iter().enumerate() {
+                            let suffix = if i > 0 { " [Inline]" } else { "" };
+                            frames.push(format!("{} [Native]{}", name, suffix));
+                        }
+                        symbolized = true;
+                    }
+                }
+            }
+
+            if !symbolized {
+                let label = resolve_unsymbolized_label(location, dict);
+                frames.push(format_with_tag(&label, &frame_tag));
+            }
         } else {
             for (i, line) in location.lines.iter().enumerate() {
                 let func_name = resolve_function_name(line, dict);
@@ -118,6 +177,24 @@ fn resolve_stack(
     result.push(comm);
     result.extend(frames);
     result
+}
+
+/// Try to symbolize a native frame via the local symbol store.
+fn symbolize_native(
+    store: &SymbolStore,
+    location: &profiles::Location,
+    dict: &profiles::ProfilesDictionary,
+) -> Option<Vec<String>> {
+    let resolved = store
+        .lookup(
+            store.file_id_for_basename(&resolve_mapping_filename(location, dict))?,
+            location.address,
+        )
+        .ok()?;
+    if resolved.is_empty() {
+        return None;
+    }
+    Some(resolved.into_iter().map(|f| f.func).collect())
 }
 
 fn resolve_function_name(line: &profiles::Line, dict: &profiles::ProfilesDictionary) -> String {
@@ -239,9 +316,10 @@ fn resolve_thread_name(sample: &profiles::Sample, dict: &profiles::ProfilesDicti
 pub async fn start_server(
     event_tx: mpsc::Sender<Event>,
     addr: &str,
+    store: Option<Arc<SymbolStore>>,
 ) -> Result<(), tonic::transport::Error> {
     let addr = addr.parse().expect("invalid gRPC listen address");
-    let server = ProfilesServer::new(event_tx);
+    let server = ProfilesServer::new(event_tx, store);
 
     tonic::transport::Server::builder()
         .add_service(
@@ -271,7 +349,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            let server = ProfilesServer::new(tx);
+            let server = ProfilesServer::new(tx, None);
             tonic::transport::Server::builder()
                 .add_service(collector::profiles_service_server::ProfilesServiceServer::new(server))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))

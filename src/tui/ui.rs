@@ -1,14 +1,14 @@
 use ratatui::{
+    Frame,
     buffer::Buffer,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::Paragraph,
-    Frame,
 };
 
+use super::state::{ActiveTab, ExecutablesTab, FlamegraphTab, State};
 use crate::flamegraph::{cursor_frame_rect, get_zoom_node, layout_frames, thread_rank};
-use super::state::State;
 
 const BG: Color = Color::Rgb(16, 16, 22);
 const ACCENT: Color = Color::Rgb(59, 130, 246);
@@ -19,7 +19,7 @@ const SEP_COLOR: Color = Color::Rgb(35, 35, 45);
 pub fn render(state: &mut State, frame: &mut Frame) {
     let area = frame.area();
 
-    if state.flamegraph.root.total_value == 0 {
+    if state.fg.graph.root.total_value == 0 && state.active_tab == ActiveTab::Flamegraph {
         render_waiting(frame, area, &state.listen_addr);
         return;
     }
@@ -36,12 +36,81 @@ pub fn render(state: &mut State, frame: &mut Frame) {
     .split(area);
 
     render_header(state, frame, chunks[0]);
-    render_detail_bar(state, frame, chunks[1]);
-    render_flamegraph(state, frame, chunks[2]);
-    render_footer(state, frame, chunks[3]);
 
-    if state.search_active {
-        render_search_overlay(state, frame, chunks[2]);
+    match state.active_tab {
+        ActiveTab::Flamegraph => {
+            render_detail_bar(&state.fg, frame, chunks[1]);
+            render_flamegraph(&mut state.fg, frame, chunks[2]);
+            render_keyhints(
+                state.fg.search.active,
+                FLAMEGRAPH_KEYS,
+                SEARCH_KEYS,
+                frame,
+                chunks[3],
+            );
+
+            if state.fg.search.active {
+                let items: Vec<&str> = state
+                    .fg
+                    .search
+                    .matches
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+                render_overlay(
+                    frame,
+                    chunks[2],
+                    &OverlayProps {
+                        title: " thread.name ",
+                        input: &state.fg.search.input,
+                        items: &items,
+                        cursor: state.fg.search.cursor,
+                        border_color: Color::Rgb(245, 166, 35),
+                        max_visible: 3,
+                        empty_hint: if state.fg.search.input.is_empty() {
+                            "type to filter threads..."
+                        } else {
+                            "no matches"
+                        },
+                        popup_width: 50,
+                    },
+                );
+            }
+        }
+        ActiveTab::Executables => {
+            render_exe_status_bar(state.exe.status.as_deref(), frame, chunks[1]);
+            render_exe_table(&mut state.exe, frame, chunks[2]);
+            render_keyhints(
+                state.exe.path_input.active,
+                EXE_KEYS,
+                EXE_INPUT_KEYS,
+                frame,
+                chunks[3],
+            );
+
+            if state.exe.path_input.active {
+                let pi = &state.exe.path_input;
+                let items: Vec<&str> = pi.completions.iter().map(String::as_str).collect();
+                render_overlay(
+                    frame,
+                    chunks[2],
+                    &OverlayProps {
+                        title: " executable path ",
+                        input: &pi.input,
+                        items: &items,
+                        cursor: pi.completion_cursor,
+                        border_color: ACCENT,
+                        max_visible: 5,
+                        empty_hint: if pi.input.is_empty() {
+                            "type a path..."
+                        } else {
+                            "no matches"
+                        },
+                        popup_width: 60,
+                    },
+                );
+            }
+        }
     }
 }
 
@@ -158,156 +227,197 @@ fn render_header(state: &State, frame: &mut Frame, area: Rect) {
         Span::styled(" ◆ ", Style::default().fg(ACCENT)),
         Span::styled(
             "eprofiler-tui",
-            Style::default()
-                .fg(BRIGHT)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(BRIGHT).add_modifier(Modifier::BOLD),
         ),
         sep.clone(),
-        Span::styled(state.listen_addr.clone(), Style::default().fg(Color::Rgb(130, 130, 150))),
+        Span::styled(
+            state.listen_addr.clone(),
+            Style::default().fg(Color::Rgb(130, 130, 150)),
+        ),
         sep.clone(),
-        format!("{} profiles", state.profiles_received).fg(Color::Rgb(110, 110, 130)),
+        format!("{} profiles", state.fg.profiles_received).fg(Color::Rgb(110, 110, 130)),
         sep,
-        format!("{} samples", format_count(state.samples_received)).fg(Color::Rgb(110, 110, 130)),
+        format!("{} samples", format_count(state.fg.samples_received))
+            .fg(Color::Rgb(110, 110, 130)),
     ];
     frame.render_widget(Paragraph::new(Line::from(left_spans)), area);
 
     let buf = frame.buffer_mut();
-    let (icon, label, color) = if state.frozen {
+
+    let (icon, label, status_color) = if state.fg.frozen {
         ("⏸ ", "FROZEN", Color::Rgb(234, 179, 8))
     } else {
         ("▶ ", "LIVE", Color::Rgb(34, 197, 94))
     };
     let indicator = format!(" {icon}{label} ");
-    let ix = area.x + area.width.saturating_sub(indicator.len() as u16);
+    let indicator_len = indicator.len() as u16;
+    let ix = area.x + area.width.saturating_sub(indicator_len);
     buf.set_string(
         ix,
         area.y,
         &indicator,
-        Style::default().fg(color).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(status_color)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let fg_active = state.active_tab == ActiveTab::Flamegraph;
+    let (fg_style, exe_style) = if fg_active {
+        (
+            Style::default().fg(BRIGHT).add_modifier(Modifier::BOLD),
+            Style::default().fg(DIM),
+        )
+    } else {
+        (
+            Style::default().fg(DIM),
+            Style::default().fg(BRIGHT).add_modifier(Modifier::BOLD),
+        )
+    };
+
+    let tab_sep = " │ ";
+    let tab_str_fg = "Flamegraph";
+    let tab_str_exe = "Executables";
+    let tabs_width = tab_str_fg.len() + tab_sep.len() + tab_str_exe.len() + 2;
+    let tabs_x = ix.saturating_sub(tabs_width as u16);
+
+    buf.set_string(tabs_x, area.y, " ", Style::default());
+    buf.set_string(tabs_x + 1, area.y, tab_str_fg, fg_style);
+    buf.set_string(
+        tabs_x + 1 + tab_str_fg.len() as u16,
+        area.y,
+        tab_sep,
+        Style::default().fg(Color::Rgb(55, 55, 65)),
+    );
+    buf.set_string(
+        tabs_x + 1 + tab_str_fg.len() as u16 + tab_sep.len() as u16,
+        area.y,
+        tab_str_exe,
+        exe_style,
     );
 }
 
-fn render_detail_bar(state: &State, frame: &mut Frame, area: Rect) {
-    if state.selected_name.is_empty() && state.zoom_path.is_empty() {
+fn render_detail_bar(fg: &FlamegraphTab, frame: &mut Frame, area: Rect) {
+    let sel = &fg.selection;
+    if sel.name.is_empty() && fg.zoom_path.is_empty() {
         return;
     }
 
     let sep = " │ ".fg(Color::Rgb(55, 55, 65));
-    let root_total = {
-        let zr = get_zoom_node(&state.flamegraph.root, &state.zoom_path);
-        zr.total_value
-    };
+    let root_total = get_zoom_node(&fg.graph.root, &fg.zoom_path).total_value;
 
     let mut spans: Vec<Span> = Vec::new();
 
-    if !state.zoom_path.is_empty() {
+    if !fg.zoom_path.is_empty() {
         spans.push(
-            format!(" zoomed: {} ", state.zoom_path.last().unwrap_or(&String::new()))
-                .fg(ACCENT)
-                .bold(),
+            format!(
+                " zoomed: {} ",
+                fg.zoom_path.last().unwrap_or(&String::new())
+            )
+            .fg(ACCENT)
+            .bold(),
         );
-        if !state.selected_name.is_empty() {
+        if !sel.name.is_empty() {
             spans.push(sep.clone());
         }
     }
 
-    if !state.selected_name.is_empty() {
-        let self_pct = if root_total > 0 {
-            state.selected_self as f64 / root_total as f64 * 100.0
-        } else {
-            0.0
-        };
-        let total_pct = if root_total > 0 {
-            state.selected_total as f64 / root_total as f64 * 100.0
-        } else {
-            0.0
+    if !sel.name.is_empty() {
+        let pct = |v: i64| {
+            if root_total > 0 {
+                v as f64 / root_total as f64 * 100.0
+            } else {
+                0.0
+            }
         };
 
         spans.push(" ▸ ".fg(ACCENT).bold());
         spans.push(Span::styled(
-            truncate(&state.selected_name, 40),
+            truncate(&sel.name, 40),
             Style::default().fg(BRIGHT).add_modifier(Modifier::BOLD),
         ));
         spans.push(sep.clone());
         spans.push("self: ".fg(DIM));
         spans.push(
-            format!("{} ({:.1}%)", format_count(state.selected_self as u64), self_pct)
-                .fg(Color::Rgb(249, 115, 22)),
+            format!(
+                "{} ({:.1}%)",
+                format_count(sel.self_value as u64),
+                pct(sel.self_value)
+            )
+            .fg(Color::Rgb(249, 115, 22)),
         );
         spans.push(sep.clone());
         spans.push("total: ".fg(DIM));
         spans.push(
             format!(
                 "{} ({:.1}%)",
-                format_count(state.selected_total as u64),
-                total_pct
+                format_count(sel.total_value as u64),
+                pct(sel.total_value)
             )
             .fg(Color::Rgb(234, 179, 8)),
         );
         spans.push(sep);
         spans.push("depth: ".fg(DIM));
-        spans.push(state.selected_depth.to_string().fg(Color::Rgb(130, 130, 150)));
+        spans.push(sel.depth.to_string().fg(Color::Rgb(130, 130, 150)));
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_flamegraph(state: &mut State, frame: &mut Frame, area: Rect) {
+fn render_flamegraph(fg: &mut FlamegraphTab, frame: &mut Frame, area: Rect) {
     let buf = frame.buffer_mut();
 
     if area.width < 4 || area.height < 2 {
         return;
     }
 
-    let zoom_root = get_zoom_node(&state.flamegraph.root, &state.zoom_path);
+    let zoom_root = get_zoom_node(&fg.graph.root, &fg.zoom_path);
     if zoom_root.total_value <= 0 {
         render_empty_fg(buf, area);
         return;
     }
 
-    let forced_palette = state
+    let forced_palette = fg
         .zoom_path
         .first()
-        .map(|thread_name| thread_rank(&state.flamegraph.root, thread_name));
+        .map(|name| thread_rank(&fg.graph.root, name));
 
     let frames = layout_frames(zoom_root, area.width, forced_palette);
     let max_depth = frames.iter().map(|f| f.depth).max().unwrap_or(0);
     let viewport_height = area.height as usize;
     let root_total = zoom_root.total_value;
 
-    let cursor_depth = state.cursor_path.len();
+    let cursor_depth = fg.cursor_path.len();
     if viewport_height > 0 {
-        if cursor_depth < state.scroll_y {
-            state.scroll_y = cursor_depth;
+        if cursor_depth < fg.scroll_y {
+            fg.scroll_y = cursor_depth;
         }
-        if cursor_depth >= state.scroll_y + viewport_height {
-            state.scroll_y = cursor_depth - viewport_height + 1;
+        if cursor_depth >= fg.scroll_y + viewport_height {
+            fg.scroll_y = cursor_depth - viewport_height + 1;
         }
     }
-    let max_scroll = max_depth.saturating_sub(viewport_height.saturating_sub(1));
-    if state.scroll_y > max_scroll {
-        state.scroll_y = max_scroll;
-    }
+    fg.scroll_y = fg
+        .scroll_y
+        .min(max_depth.saturating_sub(viewport_height.saturating_sub(1)));
 
-    let cursor_rect = cursor_frame_rect(zoom_root, &state.cursor_path, area.width, forced_palette);
+    let cursor_rect = cursor_frame_rect(zoom_root, &fg.cursor_path, area.width, forced_palette);
 
     if let Some(ref cr) = cursor_rect {
-        state.selected_name = cr.name.clone();
-        state.selected_self = cr.self_value;
-        state.selected_total = cr.total_value;
-        state.selected_pct = if root_total > 0 {
+        fg.selection.name = cr.name.clone();
+        fg.selection.self_value = cr.self_value;
+        fg.selection.total_value = cr.total_value;
+        fg.selection.pct = if root_total > 0 {
             cr.total_value as f64 / root_total as f64 * 100.0
         } else {
             0.0
         };
-        state.selected_depth = cr.depth;
+        fg.selection.depth = cr.depth;
     }
 
     for fr in &frames {
-        if fr.depth < state.scroll_y {
+        if fr.depth < fg.scroll_y {
             continue;
         }
-        let vis_depth = fr.depth - state.scroll_y;
+        let vis_depth = fr.depth - fg.scroll_y;
         if vis_depth >= viewport_height {
             continue;
         }
@@ -332,7 +442,7 @@ fn render_flamegraph(state: &mut State, frame: &mut Frame, area: Rect) {
         } else {
             flame_color(&fr.name, heat, fr.palette_index)
         };
-        let fg = contrast_fg(bg);
+        let fg_color = contrast_fg(bg);
 
         let x_start = area.x + fr.x;
         let x_end = (area.x + fr.x + fr.width).min(area.x + area.width);
@@ -359,11 +469,11 @@ fn render_flamegraph(state: &mut State, frame: &mut Frame, area: Rect) {
 
             let style = if is_cursor {
                 Style::default()
-                    .fg(fg)
+                    .fg(fg_color)
                     .bg(bg)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(fg).bg(bg)
+                Style::default().fg(fg_color).bg(bg)
             };
             buf.set_string(name_x, screen_y, &name, style);
         }
@@ -374,8 +484,13 @@ fn render_flamegraph(state: &mut State, frame: &mut Frame, area: Rect) {
                 let pct_str = format!("{:.1}%", pct);
                 let pct_x = area.x + fr.x + fr.width - pct_str.len() as u16 - 2;
                 if pct_x > area.x + fr.x + 2 {
-                    let dim_fg = blend(fg, bg, 0.45);
-                    buf.set_string(pct_x, screen_y, &pct_str, Style::default().fg(dim_fg).bg(bg));
+                    let dim_fg = blend(fg_color, bg, 0.45);
+                    buf.set_string(
+                        pct_x,
+                        screen_y,
+                        &pct_str,
+                        Style::default().fg(dim_fg).bg(bg),
+                    );
                 }
             }
         }
@@ -398,7 +513,7 @@ fn render_flamegraph(state: &mut State, frame: &mut Frame, area: Rect) {
         if screen_y >= area.y + area.height {
             break;
         }
-        let depth = state.scroll_y + vis_d;
+        let depth = fg.scroll_y + vis_d;
         let has_frame = frames.iter().any(|f| f.depth == depth);
         if !has_frame && depth <= max_depth {
             for x in area.x..area.x + area.width {
@@ -425,59 +540,201 @@ fn render_empty_fg(buf: &mut Buffer, area: Rect) {
     );
 }
 
-fn render_footer(state: &State, frame: &mut Frame, area: Rect) {
-    let key = Color::Rgb(80, 80, 100);
-    let desc = Color::Rgb(55, 55, 65);
+fn render_exe_status_bar(status: Option<&str>, frame: &mut Frame, area: Rect) {
+    let Some(status) = status else { return };
 
-    if state.search_active {
-        let spans: Vec<Span> = vec![
-            " [Esc]".fg(key),
-            " cancel ".fg(desc),
-            "[Enter]".fg(key),
-            " select ".fg(desc),
-            "[↑↓]".fg(key),
-            " navigate ".fg(desc),
-        ];
-        frame.render_widget(
-            Paragraph::new(Line::from(spans)).alignment(Alignment::Left),
-            area,
-        );
+    let is_loading = status.starts_with("Loading") || status.starts_with("Removing");
+    let is_error = status.starts_with("Error");
+
+    let display = if is_loading {
+        format!("{status}...")
     } else {
-        let spans: Vec<Span> = vec![
-            " [q]".fg(key),
-            " quit ".fg(desc),
-            "[f/Space]".fg(key),
-            " freeze ".fg(desc),
-            "[j/↓ k/↑]".fg(key),
-            " depth ".fg(desc),
-            "[h/← l/→]".fg(key),
-            " frame ".fg(desc),
-            "[Enter]".fg(key),
-            " zoom ".fg(desc),
-            "[Esc]".fg(key),
-            " back ".fg(desc),
-            "[/]".fg(key),
-            " search ".fg(desc),
-            "[r]".fg(key),
-            " reset ".fg(desc),
-        ];
-        frame.render_widget(
-            Paragraph::new(Line::from(spans)).alignment(Alignment::Left),
-            area,
+        status.to_owned()
+    };
+    let color = if is_loading {
+        Color::Rgb(234, 179, 8)
+    } else if is_error {
+        Color::Rgb(239, 68, 68)
+    } else {
+        Color::Rgb(34, 197, 94)
+    };
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            " ".into(),
+            Span::styled(display, Style::default().fg(color)),
+        ])),
+        area,
+    );
+}
+
+fn render_exe_table(exe: &mut ExecutablesTab, frame: &mut Frame, area: Rect) {
+    let buf = frame.buffer_mut();
+
+    if area.height < 2 {
+        return;
+    }
+
+    let header_y = area.y;
+    let col_id_w = 34u16.min(area.width / 3);
+    let col_sym_w = 12u16;
+    let col_name_w = area.width.saturating_sub(col_id_w + col_sym_w + 4);
+
+    let hdr_style = Style::default().fg(DIM).add_modifier(Modifier::BOLD);
+    buf.set_string(area.x + 1, header_y, "File ID", hdr_style);
+    buf.set_string(area.x + 1 + col_id_w, header_y, "Name", hdr_style);
+    buf.set_string(
+        area.x + 1 + col_id_w + col_name_w,
+        header_y,
+        "Symbols",
+        hdr_style,
+    );
+
+    let sep_y = header_y + 1;
+    if sep_y >= area.y + area.height {
+        return;
+    }
+    for x in area.x..area.x + area.width {
+        if let Some(c) = buf.cell_mut((x, sep_y)) {
+            c.set_char('─');
+            c.set_style(Style::default().fg(SEP_COLOR));
+        }
+    }
+
+    let visible_rows = (area.y + area.height).saturating_sub(sep_y + 1) as usize;
+    if visible_rows == 0 {
+        return;
+    }
+
+    if exe.cursor < exe.scroll {
+        exe.scroll = exe.cursor;
+    }
+    if exe.cursor >= exe.scroll + visible_rows {
+        exe.scroll = exe.cursor + 1 - visible_rows;
+    }
+
+    let cursor_bg = Color::Rgb(40, 45, 65);
+    let na_fg = Color::Rgb(80, 80, 100);
+
+    for vis_row in 0..visible_rows {
+        let idx = exe.scroll + vis_row;
+        if idx >= exe.list.len() {
+            break;
+        }
+        let entry = &exe.list[idx];
+        let y = sep_y + 1 + vis_row as u16;
+        let is_cursor = idx == exe.cursor;
+        let is_sym = entry.num_ranges.is_some();
+
+        if is_cursor {
+            for x in area.x..area.x + area.width {
+                if let Some(c) = buf.cell_mut((x, y)) {
+                    c.set_char(' ');
+                    c.set_style(Style::default().bg(cursor_bg));
+                }
+            }
+        }
+
+        let row_bg = if is_cursor { cursor_bg } else { Color::Reset };
+
+        let id_str = match entry.file_id {
+            Some(file_id) => {
+                let hex = file_id.format_hex();
+                if hex.len() > col_id_w as usize - 1 {
+                    format!("{}…", &hex[..col_id_w as usize - 2])
+                } else {
+                    hex
+                }
+            }
+            None => "N/A".to_string(),
+        };
+        let id_fg = if is_sym {
+            Color::Rgb(100, 100, 120)
+        } else {
+            na_fg
+        };
+        buf.set_string(
+            area.x + 1,
+            y,
+            &id_str,
+            Style::default().fg(id_fg).bg(row_bg),
         );
+
+        let prefix = if is_cursor { "▸ " } else { "  " };
+        let max_name = (col_name_w as usize).saturating_sub(prefix.len() + 1);
+        let name = truncate(&entry.name, max_name);
+        let name_fg = if is_cursor {
+            BRIGHT
+        } else if is_sym {
+            Color::Rgb(180, 180, 195)
+        } else {
+            Color::Rgb(120, 120, 140)
+        };
+        let name_style = if is_cursor {
+            Style::default()
+                .fg(name_fg)
+                .bg(row_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(name_fg).bg(row_bg)
+        };
+        buf.set_string(
+            area.x + 1 + col_id_w,
+            y,
+            &format!("{prefix}{name}"),
+            name_style,
+        );
+
+        let sym_str = entry
+            .num_ranges
+            .map_or("N/A".to_string(), |n| format_count(n as u64));
+        let sym_fg = if is_sym {
+            Color::Rgb(34, 197, 94)
+        } else {
+            na_fg
+        };
+        buf.set_string(
+            area.x + 1 + col_id_w + col_name_w,
+            y,
+            &sym_str,
+            Style::default().fg(sym_fg).bg(row_bg),
+        );
+    }
+
+    if exe.list.is_empty() && !exe.path_input.active {
+        let msg = "No executables discovered. Waiting for profiles...";
+        let y = sep_y + 2;
+        if y < area.y + area.height {
+            buf.set_string(
+                area.x + 2,
+                y,
+                msg,
+                Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
+            );
+        }
     }
 }
 
-fn render_search_overlay(state: &State, frame: &mut Frame, area: Rect) {
+struct OverlayProps<'a> {
+    title: &'a str,
+    input: &'a str,
+    items: &'a [&'a str],
+    cursor: usize,
+    border_color: Color,
+    max_visible: usize,
+    empty_hint: &'a str,
+    popup_width: u16,
+}
+
+fn render_overlay(frame: &mut Frame, area: Rect, props: &OverlayProps) {
     let buf = frame.buffer_mut();
 
-    let popup_w = 50u16.min(area.width.saturating_sub(4));
+    let popup_w = props.popup_width.min(area.width.saturating_sub(4));
     if popup_w < 10 {
         return;
     }
 
-    let max_visible = 3usize;
-    let match_count = state.search_matches.len().min(max_visible);
+    let match_count = props.items.len().min(props.max_visible);
     let popup_h = (match_count as u16 + 4).min(area.height.saturating_sub(2));
     if popup_h < 4 {
         return;
@@ -485,162 +742,200 @@ fn render_search_overlay(state: &State, frame: &mut Frame, area: Rect) {
 
     let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
     let popup_y = area.y + area.height.saturating_sub(popup_h);
-
     let popup = Rect::new(popup_x, popup_y, popup_w, popup_h);
 
-    let border_fg = Color::Rgb(245, 166, 35);
-    let input_fg = BRIGHT;
-    let match_fg = Color::Rgb(180, 180, 195);
-    let highlight_bg = Color::Rgb(40, 45, 65);
-    let dim_fg = Color::Rgb(80, 80, 100);
+    clear_rect(buf, popup);
+    draw_popup_border(buf, popup, props.title, props.border_color);
 
-    for y in popup.y..popup.y + popup.height {
-        for x in popup.x..popup.x + popup.width {
+    let inner_w = popup.width.saturating_sub(2) as usize;
+    let prompt = format!(" / {}█", truncate(props.input, inner_w.saturating_sub(5)));
+    buf.set_string(
+        popup.x + 1,
+        popup.y + 1,
+        &truncate(&prompt, inner_w),
+        Style::reset().fg(BRIGHT),
+    );
+
+    for x in (popup.x + 1)..(popup.x + popup.width - 1) {
+        if let Some(c) = buf.cell_mut((x, popup.y + 2)) {
+            c.set_char('─');
+            c.set_style(Style::reset().fg(Color::Rgb(60, 60, 75)));
+        }
+    }
+
+    let list_y = popup.y + 3;
+    let visible = match_count.min((popup.height.saturating_sub(4)) as usize);
+
+    if props.items.is_empty() {
+        buf.set_string(
+            popup.x + 2,
+            list_y,
+            props.empty_hint,
+            Style::reset()
+                .fg(Color::Rgb(80, 80, 100))
+                .add_modifier(Modifier::ITALIC),
+        );
+        return;
+    }
+
+    let scroll_off = props.cursor.saturating_sub(visible.saturating_sub(1));
+    let match_fg = Color::Rgb(180, 180, 195);
+    let dir_fg = Color::Rgb(96, 165, 250);
+    let highlight_bg = Color::Rgb(40, 45, 65);
+
+    for i in 0..visible {
+        let idx = scroll_off + i;
+        if idx >= props.items.len() {
+            break;
+        }
+        let item = props.items[idx];
+        let y = list_y + i as u16;
+        let selected = idx == props.cursor;
+        let is_dir = item.ends_with('/');
+
+        let row_fg = if selected {
+            BRIGHT
+        } else if is_dir {
+            dir_fg
+        } else {
+            match_fg
+        };
+
+        if selected {
+            for x in (popup.x + 1)..(popup.x + popup.width - 1) {
+                if let Some(c) = buf.cell_mut((x, y)) {
+                    c.set_char(' ');
+                    c.set_style(Style::reset().bg(highlight_bg));
+                }
+            }
+        }
+
+        let prefix = if selected { " ▸ " } else { "   " };
+        let display = format!("{prefix}{}", truncate(item, inner_w.saturating_sub(3)));
+        let style = if selected {
+            Style::reset()
+                .fg(row_fg)
+                .bg(highlight_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::reset().fg(row_fg)
+        };
+        buf.set_string(popup.x + 1, y, &display, style);
+    }
+}
+
+fn clear_rect(buf: &mut Buffer, r: Rect) {
+    for y in r.y..r.y + r.height {
+        for x in r.x..r.x + r.width {
             if let Some(c) = buf.cell_mut((x, y)) {
                 c.set_char(' ');
                 c.set_style(Style::reset());
             }
         }
     }
+}
 
-    let top_y = popup.y;
-    for x in popup.x..popup.x + popup.width {
-        if let Some(c) = buf.cell_mut((x, top_y)) {
-            let ch = if x == popup.x {
-                '╭'
-            } else if x == popup.x + popup.width - 1 {
-                '╮'
-            } else {
-                '─'
-            };
-            c.set_char(ch);
-            c.set_style(Style::reset().fg(border_fg));
+fn draw_popup_border(buf: &mut Buffer, popup: Rect, title: &str, border_color: Color) {
+    let bot_y = popup.y + popup.height - 1;
+    let border = Style::reset().fg(border_color);
+
+    for &(y, left, right) in &[(popup.y, '╭', '╮'), (bot_y, '╰', '╯')] {
+        for x in popup.x..popup.x + popup.width {
+            if let Some(c) = buf.cell_mut((x, y)) {
+                let ch = if x == popup.x {
+                    left
+                } else if x == popup.x + popup.width - 1 {
+                    right
+                } else {
+                    '─'
+                };
+                c.set_char(ch);
+                c.set_style(border);
+            }
         }
     }
 
-    let title = " 🔍 thread.name ";
-    let title_x = popup.x + 2;
     if title.len() + 3 <= popup.width as usize {
         buf.set_string(
-            title_x,
-            top_y,
+            popup.x + 2,
+            popup.y,
             title,
-            Style::reset()
-                .fg(BRIGHT)
-                .add_modifier(Modifier::BOLD),
+            Style::reset().fg(BRIGHT).add_modifier(Modifier::BOLD),
         );
-    }
-
-    let bot_y = popup.y + popup.height - 1;
-    for x in popup.x..popup.x + popup.width {
-        if let Some(c) = buf.cell_mut((x, bot_y)) {
-            let ch = if x == popup.x {
-                '╰'
-            } else if x == popup.x + popup.width - 1 {
-                '╯'
-            } else {
-                '─'
-            };
-            c.set_char(ch);
-            c.set_style(Style::reset().fg(border_fg));
-        }
     }
 
     for y in (popup.y + 1)..bot_y {
-        if let Some(c) = buf.cell_mut((popup.x, y)) {
-            c.set_char('│');
-            c.set_style(Style::reset().fg(border_fg));
-        }
-        if let Some(c) = buf.cell_mut((popup.x + popup.width - 1, y)) {
-            c.set_char('│');
-            c.set_style(Style::reset().fg(border_fg));
-        }
-    }
-
-    let input_y = popup.y + 1;
-    let inner_w = popup.width.saturating_sub(2) as usize;
-    let prompt = format!(
-        " / {}█",
-        truncate(&state.search_input, inner_w.saturating_sub(5))
-    );
-    buf.set_string(
-        popup.x + 1,
-        input_y,
-        &truncate(&prompt, inner_w),
-        Style::reset().fg(input_fg),
-    );
-
-    let sep_y = popup.y + 2;
-    for x in (popup.x + 1)..(popup.x + popup.width - 1) {
-        if let Some(c) = buf.cell_mut((x, sep_y)) {
-            c.set_char('─');
-            c.set_style(Style::reset().fg(Color::Rgb(60, 60, 75)));
-        }
-    }
-
-    let list_start_y = popup.y + 3;
-    let visible = match_count.min((popup.height.saturating_sub(4)) as usize);
-
-    let scroll_off = if state.search_cursor >= visible {
-        state.search_cursor - visible + 1
-    } else {
-        0
-    };
-
-    if state.search_matches.is_empty() {
-        let msg = if state.search_input.is_empty() {
-            "type to filter threads..."
-        } else {
-            "no matches"
-        };
-        buf.set_string(
-            popup.x + 2,
-            list_start_y,
-            msg,
-            Style::reset()
-                .fg(dim_fg)
-                .add_modifier(Modifier::ITALIC),
-        );
-    } else {
-        for i in 0..visible {
-            let match_idx = scroll_off + i;
-            if match_idx >= state.search_matches.len() {
-                break;
+        for &x in &[popup.x, popup.x + popup.width - 1] {
+            if let Some(c) = buf.cell_mut((x, y)) {
+                c.set_char('│');
+                c.set_style(border);
             }
-            let (ref name, _) = state.search_matches[match_idx];
-            let y = list_start_y + i as u16;
-            let is_selected = match_idx == state.search_cursor;
-
-            let row_fg = if is_selected { BRIGHT } else { match_fg };
-
-            if is_selected {
-                for x in (popup.x + 1)..(popup.x + popup.width - 1) {
-                    if let Some(c) = buf.cell_mut((x, y)) {
-                        c.set_char(' ');
-                        c.set_style(Style::reset().bg(highlight_bg));
-                    }
-                }
-            }
-
-            let prefix = if is_selected { " ▸ " } else { "   " };
-            let display = format!(
-                "{}{}",
-                prefix,
-                truncate(name, inner_w.saturating_sub(3))
-            );
-
-            let style = if is_selected {
-                Style::reset()
-                    .fg(row_fg)
-                    .bg(highlight_bg)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::reset().fg(row_fg)
-            };
-
-            buf.set_string(popup.x + 1, y, &display, style);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Footer key-hints (shared between tabs via data slices)
+// ---------------------------------------------------------------------------
+
+const FLAMEGRAPH_KEYS: &[(&str, &str)] = &[
+    ("[Tab]", " switch "),
+    ("[q]", " quit "),
+    ("[f/Space]", " freeze "),
+    ("[j/↓ k/↑]", " depth "),
+    ("[h/← l/→]", " frame "),
+    ("[Enter]", " zoom "),
+    ("[Esc]", " back "),
+    ("[/]", " search "),
+    ("[r]", " reset "),
+];
+
+const SEARCH_KEYS: &[(&str, &str)] = &[
+    ("[Esc]", " cancel "),
+    ("[Enter]", " select "),
+    ("[↑↓]", " navigate "),
+];
+
+const EXE_KEYS: &[(&str, &str)] = &[
+    ("[Tab]", " switch "),
+    ("[j/k]", " navigate "),
+    ("[Enter]", " symbolize "),
+    ("[r]", " remove "),
+    ("[/]", " add new "),
+    ("[q]", " quit "),
+];
+
+const EXE_INPUT_KEYS: &[(&str, &str)] = &[
+    ("[Esc]", " cancel "),
+    ("[Tab]", " complete "),
+    ("[↑↓]", " navigate "),
+    ("[Enter]", " load "),
+];
+
+fn render_keyhints(
+    overlay_active: bool,
+    normal: &[(&str, &str)],
+    overlay: &[(&str, &str)],
+    frame: &mut Frame,
+    area: Rect,
+) {
+    let key_fg = Color::Rgb(80, 80, 100);
+    let desc_fg = Color::Rgb(55, 55, 65);
+    let hints = if overlay_active { overlay } else { normal };
+
+    let spans: Vec<Span> = hints
+        .iter()
+        .enumerate()
+        .flat_map(|(i, (k, d))| {
+            let prefix = if i == 0 { " " } else { "" };
+            [format!("{prefix}{k}").fg(key_fg), (*d).fg(desc_fg)]
+        })
+        .collect();
+
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).alignment(Alignment::Left),
+        area,
+    );
 }
 
 const PALETTES: &[&[(f64, (u8, u8, u8))]] = &[
@@ -711,14 +1006,12 @@ const PALETTES: &[&[(f64, (u8, u8, u8))]] = &[
 ];
 
 fn flame_color(name: &str, heat: f64, palette_index: usize) -> Color {
-    let hash = name
-        .bytes()
-        .fold(0u64, |h, b| h.wrapping_mul(2654435761).wrapping_add(b as u64));
-
-    let h = heat.clamp(0.0, 1.0);
+    let hash = name.bytes().fold(0u64, |h, b| {
+        h.wrapping_mul(2654435761).wrapping_add(b as u64)
+    });
 
     let stops = PALETTES[palette_index % PALETTES.len()];
-    let (r, g, b) = gradient(h, stops);
+    let (r, g, b) = gradient(heat.clamp(0.0, 1.0), stops);
 
     let rv = ((hash % 18) as i16 - 9).clamp(-12, 12);
     let gv = (((hash >> 5) % 14) as i16 - 7).clamp(-10, 10);
@@ -793,11 +1086,9 @@ fn darken(c: Color, amount: u8) -> Color {
 
 fn blend(c1: Color, c2: Color, t: f64) -> Color {
     match (c1, c2) {
-        (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) => Color::Rgb(
-            lerp_u8(r1, r2, t),
-            lerp_u8(g1, g2, t),
-            lerp_u8(b1, b2, t),
-        ),
+        (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) => {
+            Color::Rgb(lerp_u8(r1, r2, t), lerp_u8(g1, g2, t), lerp_u8(b1, b2, t))
+        }
         _ => c1,
     }
 }
