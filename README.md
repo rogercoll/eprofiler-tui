@@ -20,6 +20,7 @@ A terminal-based flamegraph viewer that receives profiling data via an OTLP gRPC
 - Thread/process grouping via `thread.name` sample attribute
 - Keyboard-driven navigation and zoom
 - Thread search (`/`) with fuzzy filtering
+- **Experimental**: Flamescope tab (https://www.brendangregg.com/flamescope.html)
 - **Experimental**: Executables tab — load debug symbols from ELF/DWARF binaries for inline-aware symbolization (persistent LSM-tree store survives restarts)
 
 ![Demo](content/assets/quickstart.gif)

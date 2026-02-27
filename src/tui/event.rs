@@ -1,4 +1,5 @@
 use ratatui::crossterm::event::{self, Event as CrosstermEvent, KeyEvent, KeyEventKind};
+use std::collections::HashMap;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -18,6 +19,7 @@ pub enum Event {
     ProfileUpdate {
         flamegraph: FlameGraph,
         samples: u64,
+        timestamps: HashMap<String, Vec<u64>>,
     },
     MappingsDiscovered(Vec<String>),
     SymbolsLoaded {

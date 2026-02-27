@@ -1,8 +1,10 @@
 mod executables;
 mod flamegraph;
+mod flamescope;
 
 pub use executables::ExecutablesTab;
 pub use flamegraph::FlamegraphTab;
+pub use flamescope::FlamescopeTab;
 
 use std::path::PathBuf;
 
@@ -13,6 +15,7 @@ use crate::storage::{ExecutableInfo, FileId};
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ActiveTab {
     Flamegraph,
+    Flamescope,
     Executables,
 }
 
@@ -27,6 +30,7 @@ pub struct State {
     pub listen_addr: String,
     pub active_tab: ActiveTab,
     pub fg: FlamegraphTab,
+    pub fs: FlamescopeTab,
     pub exe: ExecutablesTab,
 }
 
@@ -37,6 +41,7 @@ impl State {
             listen_addr,
             active_tab: ActiveTab::Flamegraph,
             fg: FlamegraphTab::default(),
+            fs: FlamescopeTab::default(),
             exe: ExecutablesTab::from(initial_exes),
         }
     }
@@ -47,11 +52,13 @@ impl State {
             return Action::None;
         }
 
-        let overlay_active = self.fg.search.active || self.exe.path_input.active;
+        let overlay_active =
+            self.fg.search.active || self.fs.search.active || self.exe.path_input.active;
 
         if key.code == KeyCode::Tab && !overlay_active {
             self.active_tab = match self.active_tab {
-                ActiveTab::Flamegraph => ActiveTab::Executables,
+                ActiveTab::Flamegraph => ActiveTab::Flamescope,
+                ActiveTab::Flamescope => ActiveTab::Executables,
                 ActiveTab::Executables => ActiveTab::Flamegraph,
             };
             return Action::None;
@@ -65,6 +72,10 @@ impl State {
         match self.active_tab {
             ActiveTab::Flamegraph => {
                 self.fg.handle_key(key);
+                Action::None
+            }
+            ActiveTab::Flamescope => {
+                self.fs.handle_key(key);
                 Action::None
             }
             ActiveTab::Executables => self.exe.handle_key(key),
