@@ -126,7 +126,11 @@ fn main() -> Result<()> {
             Event::ProfileUpdate {
                 flamegraph,
                 samples,
+                timestamps,
             } => {
+                if !state.fg.frozen {
+                    state.fs.record_timestamps(&timestamps);
+                }
                 state.fg.merge(flamegraph, samples);
             }
             Event::MappingsDiscovered(names) => {

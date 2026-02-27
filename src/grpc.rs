@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock, mpsc};
 use tonic::{Request, Response, Status};
 
@@ -12,7 +12,7 @@ use eprofiler_proto::opentelemetry::proto::profiles::v1development as profiles;
 pub struct ProfilesServer {
     event_tx: mpsc::Sender<Event>,
     store: Option<Arc<SymbolStore>>,
-    known_basenames: RwLock<HashSet<String>>,
+    known_basenames: Arc<RwLock<HashSet<String>>>,
 }
 
 impl ProfilesServer {
@@ -20,36 +20,89 @@ impl ProfilesServer {
         Self {
             event_tx,
             store,
-            known_basenames: RwLock::new(HashSet::new()),
+            known_basenames: Arc::new(RwLock::new(HashSet::new())),
+        }
+    }
+}
+
+fn unknown_basenames(
+    known: &RwLock<HashSet<String>>,
+    dict: &profiles::ProfilesDictionary,
+) -> Vec<String> {
+    dict.mapping_table
+        .iter()
+        .skip(1)
+        .fold(Vec::new(), |mut names, mapping| {
+            let name_idx = mapping.filename_strindex as usize;
+            if name_idx == 0 || name_idx >= dict.string_table.len() {
+                return names;
+            }
+            let full_path = &dict.string_table[name_idx];
+            if !full_path.is_empty() && !known.read().unwrap().contains(full_path) {
+                let basename = full_path.rsplit('/').next().unwrap_or(full_path);
+                if !basename.is_empty() && !basename.starts_with('[') {
+                    known.write().unwrap().insert(full_path.to_string());
+                    names.push(basename.to_string());
+                }
+            }
+            names
+        })
+}
+
+fn process_export(
+    req: collector::ExportProfilesServiceRequest,
+    store: Option<&SymbolStore>,
+    known: &RwLock<HashSet<String>>,
+    event_tx: &mpsc::Sender<Event>,
+) {
+    let mut flamegraph = FlameGraph::new();
+    let dict = req.dictionary.as_ref();
+
+    let mut sample_count: u64 = 0;
+    let mut thread_timestamps: HashMap<String, Vec<u64>> = HashMap::new();
+
+    for resource_profiles in &req.resource_profiles {
+        for scope_profiles in &resource_profiles.scope_profiles {
+            for profile in &scope_profiles.profiles {
+                for sample in &profile.samples {
+                    let stack = resolve_stack(sample, dict, store);
+                    if stack.is_empty() {
+                        continue;
+                    }
+
+                    let value = if !sample.timestamps_unix_nano.is_empty() {
+                        sample.timestamps_unix_nano.len() as i64
+                    } else if !sample.values.is_empty() {
+                        sample.values.iter().sum::<i64>().max(1)
+                    } else {
+                        1
+                    };
+
+                    if !sample.timestamps_unix_nano.is_empty() {
+                        thread_timestamps
+                            .entry(stack[0].clone())
+                            .or_default()
+                            .extend_from_slice(&sample.timestamps_unix_nano);
+                    }
+                    flamegraph.add_stack(&stack, value);
+                    sample_count += value as u64;
+                }
+            }
         }
     }
 
-    fn unknown_basenames(&self, dict: &profiles::ProfilesDictionary) -> Vec<String> {
-        dict.mapping_table
-            .iter()
-            .skip(1)
-            .fold(Vec::new(), |mut names, mapping| {
-                let name_idx = mapping.filename_strindex as usize;
-                if name_idx == 0 || name_idx >= dict.string_table.len() {
-                    return names;
-                }
-                let full_path = &dict.string_table[name_idx];
-                // TODO: handle unwrap
-                if !full_path.is_empty()
-                    && !self.known_basenames.read().unwrap().contains(full_path)
-                {
-                    let basename = full_path.rsplit('/').next().unwrap_or(full_path);
-                    if !basename.is_empty() && !basename.starts_with('[') {
-                        self.known_basenames
-                            .write()
-                            .unwrap()
-                            .insert(full_path.to_string());
-                        names.push(basename.to_string());
-                    }
-                }
-                return names;
-            })
+    if let Some(dict) = dict {
+        let basenames = unknown_basenames(known, dict);
+        if !basenames.is_empty() {
+            let _ = event_tx.send(Event::MappingsDiscovered(basenames));
+        }
     }
+
+    let _ = event_tx.send(Event::ProfileUpdate {
+        flamegraph,
+        samples: sample_count,
+        timestamps: thread_timestamps,
+    });
 }
 
 #[tonic::async_trait]
@@ -59,47 +112,12 @@ impl collector::profiles_service_server::ProfilesService for ProfilesServer {
         request: Request<collector::ExportProfilesServiceRequest>,
     ) -> Result<Response<collector::ExportProfilesServiceResponse>, Status> {
         let req = request.into_inner();
-        let mut flamegraph = FlameGraph::new();
-        let dict = req.dictionary.as_ref();
+        let store = self.store.clone();
+        let known = Arc::clone(&self.known_basenames);
+        let tx = self.event_tx.clone();
 
-        let mut sample_count: u64 = 0;
-
-        for resource_profiles in &req.resource_profiles {
-            for scope_profiles in &resource_profiles.scope_profiles {
-                for profile in &scope_profiles.profiles {
-                    for sample in &profile.samples {
-                        let stack = resolve_stack(sample, dict, self.store.as_deref());
-                        if stack.is_empty() {
-                            continue;
-                        }
-
-                        let value = if !sample.timestamps_unix_nano.is_empty() {
-                            sample.timestamps_unix_nano.len() as i64
-                        } else if !sample.values.is_empty() {
-                            sample.values.iter().sum::<i64>().max(1)
-                        } else {
-                            1
-                        };
-
-                        flamegraph.add_stack(&stack, value);
-                        sample_count += value as u64;
-                    }
-                }
-            }
-        }
-
-        flamegraph.root.sort_recursive();
-
-        if let Some(dict) = dict {
-            let basenames = self.unknown_basenames(dict);
-            if !basenames.is_empty() {
-                let _ = self.event_tx.send(Event::MappingsDiscovered(basenames));
-            }
-        }
-
-        let _ = self.event_tx.send(Event::ProfileUpdate {
-            flamegraph,
-            samples: sample_count,
+        tokio::task::spawn_blocking(move || {
+            process_export(req, store.as_deref(), &known, &tx);
         });
 
         Ok(Response::new(collector::ExportProfilesServiceResponse {
@@ -453,8 +471,10 @@ mod tests {
             Event::ProfileUpdate {
                 flamegraph,
                 samples,
+                timestamps,
             } => {
                 assert_eq!(samples, 10);
+                assert!(timestamps.is_empty());
                 let thread = &flamegraph.root.children[0];
                 assert_eq!(thread.name, "worker-1");
                 assert_eq!(thread.total_value, 10);
@@ -502,8 +522,13 @@ mod tests {
             Event::ProfileUpdate {
                 flamegraph,
                 samples,
+                timestamps,
             } => {
                 assert_eq!(samples, 5);
+                assert_eq!(
+                    timestamps.get("worker-1").unwrap(),
+                    &vec![100, 200, 300, 400, 500]
+                );
                 let thread = &flamegraph.root.children[0];
                 assert_eq!(thread.total_value, 5);
             }

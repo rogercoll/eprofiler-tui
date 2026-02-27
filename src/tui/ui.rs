@@ -7,7 +7,8 @@ use ratatui::{
     widgets::Paragraph,
 };
 
-use super::state::{ActiveTab, ExecutablesTab, FlamegraphTab, State};
+use super::flamescope_layout::FlamescopeLayout;
+use super::state::{ActiveTab, ExecutablesTab, FlamegraphTab, FlamescopeTab, State};
 use crate::flamegraph::{cursor_frame_rect, get_zoom_node, layout_frames, thread_rank};
 
 const BG: Color = Color::Rgb(16, 16, 22);
@@ -68,6 +69,39 @@ pub fn render(state: &mut State, frame: &mut Frame) {
                         border_color: Color::Rgb(245, 166, 35),
                         max_visible: 3,
                         empty_hint: if state.fg.search.input.is_empty() {
+                            "type to filter threads..."
+                        } else {
+                            "no matches"
+                        },
+                        popup_width: 50,
+                    },
+                );
+            }
+        }
+        ActiveTab::Flamescope => {
+            render_flamescope_detail_bar(&state.fs, frame, chunks[1]);
+            render_flamescope(&mut state.fs, frame, chunks[2]);
+            render_keyhints(
+                state.fs.search.active,
+                FLAMESCOPE_KEYS,
+                SEARCH_KEYS,
+                frame,
+                chunks[3],
+            );
+
+            if state.fs.search.active {
+                let items: Vec<&str> = state.fs.search.matches.iter().map(String::as_str).collect();
+                render_overlay(
+                    frame,
+                    chunks[2],
+                    &OverlayProps {
+                        title: " thread.name ",
+                        input: &state.fs.search.input,
+                        items: &items,
+                        cursor: state.fs.search.cursor,
+                        border_color: Color::Rgb(245, 166, 35),
+                        max_visible: 3,
+                        empty_hint: if state.fs.search.input.is_empty() {
                             "type to filter threads..."
                         } else {
                             "no matches"
@@ -261,39 +295,35 @@ fn render_header(state: &State, frame: &mut Frame, area: Rect) {
             .add_modifier(Modifier::BOLD),
     );
 
-    let fg_active = state.active_tab == ActiveTab::Flamegraph;
-    let (fg_style, exe_style) = if fg_active {
-        (
-            Style::default().fg(BRIGHT).add_modifier(Modifier::BOLD),
-            Style::default().fg(DIM),
-        )
-    } else {
-        (
-            Style::default().fg(DIM),
-            Style::default().fg(BRIGHT).add_modifier(Modifier::BOLD),
-        )
-    };
-
+    let active_style = Style::default().fg(BRIGHT).add_modifier(Modifier::BOLD);
+    let inactive_style = Style::default().fg(DIM);
     let tab_sep = " │ ";
-    let tab_str_fg = "Flamegraph";
-    let tab_str_exe = "Executables";
-    let tabs_width = tab_str_fg.len() + tab_sep.len() + tab_str_exe.len() + 2;
+    let sep_style = Style::default().fg(Color::Rgb(55, 55, 65));
+
+    let tabs: &[(&str, ActiveTab)] = &[
+        ("Flamegraph", ActiveTab::Flamegraph),
+        ("Flamescope", ActiveTab::Flamescope),
+        ("Executables", ActiveTab::Executables),
+    ];
+    let tabs_width: usize =
+        tabs.iter().map(|(l, _)| l.len()).sum::<usize>() + tab_sep.len() * (tabs.len() - 1) + 2;
     let tabs_x = ix.saturating_sub(tabs_width as u16);
 
     buf.set_string(tabs_x, area.y, " ", Style::default());
-    buf.set_string(tabs_x + 1, area.y, tab_str_fg, fg_style);
-    buf.set_string(
-        tabs_x + 1 + tab_str_fg.len() as u16,
-        area.y,
-        tab_sep,
-        Style::default().fg(Color::Rgb(55, 55, 65)),
-    );
-    buf.set_string(
-        tabs_x + 1 + tab_str_fg.len() as u16 + tab_sep.len() as u16,
-        area.y,
-        tab_str_exe,
-        exe_style,
-    );
+    let mut x = tabs_x + 1;
+    for (i, &(label, tab)) in tabs.iter().enumerate() {
+        if i > 0 {
+            buf.set_string(x, area.y, tab_sep, sep_style);
+            x += tab_sep.len() as u16;
+        }
+        let style = if state.active_tab == tab {
+            active_style
+        } else {
+            inactive_style
+        };
+        buf.set_string(x, area.y, label, style);
+        x += label.len() as u16;
+    }
 }
 
 fn render_detail_bar(fg: &FlamegraphTab, frame: &mut Frame, area: Rect) {
@@ -538,6 +568,157 @@ fn render_empty_fg(buf: &mut Buffer, area: Rect) {
             .fg(Color::Rgb(90, 90, 110))
             .add_modifier(Modifier::ITALIC),
     );
+}
+
+// Flamescope (subsecond-offset heatmap)
+const HEATMAP_STOPS: &[(f64, (u8, u8, u8))] = &[
+    (0.00, (13, 8, 135)),
+    (0.25, (126, 3, 168)),
+    (0.50, (204, 71, 120)),
+    (0.75, (249, 149, 64)),
+    (1.00, (252, 255, 164)),
+];
+
+fn heatmap_color(value: u64, max: u64) -> Color {
+    let t = ((value as f64).sqrt() / (max as f64).sqrt()).clamp(0.0, 1.0);
+    let (r, g, b) = gradient(t, HEATMAP_STOPS);
+    Color::Rgb(r, g, b)
+}
+
+fn render_flamescope_detail_bar(fs: &FlamescopeTab, frame: &mut Frame, area: Rect) {
+    if fs.visible_columns().is_empty() {
+        return;
+    }
+
+    let (sec, ms_start, ms_end) = fs.selected_time();
+    let value = fs.selected_value();
+    let peak = fs.visible_peak();
+    let sep = " │ ".fg(Color::Rgb(55, 55, 65));
+
+    let mut spans: Vec<Span> = Vec::new();
+
+    if let Some(ref filter) = fs.filter {
+        spans.push(format!(" filtered: {filter} ").fg(ACCENT).bold());
+        spans.push(sep.clone());
+    }
+
+    spans.extend([
+        " ▸ ".fg(ACCENT).bold(),
+        Span::styled(
+            format!("{sec}s + {ms_start}\u{2013}{ms_end}ms"),
+            Style::default().fg(BRIGHT).add_modifier(Modifier::BOLD),
+        ),
+        sep.clone(),
+        "samples: ".fg(DIM),
+        format!("{value}").fg(Color::Rgb(249, 115, 22)),
+        sep.clone(),
+        "peak: ".fg(DIM),
+        format!("{peak}").fg(Color::Rgb(234, 179, 8)),
+        sep,
+        "duration: ".fg(DIM),
+        format!("{}s", fs.total_seconds()).fg(Color::Rgb(130, 130, 150)),
+    ]);
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn render_flamescope(fs: &mut FlamescopeTab, frame: &mut Frame, area: Rect) {
+    let Some(lay) = FlamescopeLayout::new(area) else {
+        return;
+    };
+
+    let total_cols = fs.visible_columns().len();
+    let peak = fs.visible_peak();
+
+    if total_cols > 0 {
+        fs.cursor_col = fs.cursor_col.min(total_cols - 1);
+    }
+    if fs.auto_scroll && total_cols > 0 {
+        fs.cursor_col = total_cols - 1;
+    }
+    if fs.cursor_col < fs.scroll_x {
+        fs.scroll_x = fs.cursor_col;
+    }
+    if fs.cursor_col >= fs.scroll_x + lay.visible_cols {
+        fs.scroll_x = fs.cursor_col + 1 - lay.visible_cols;
+    }
+
+    let vis_data = fs.visible_columns();
+    let cursor_col = fs.cursor_col;
+    let cursor_row = fs.cursor_row;
+    let scroll_x = fs.scroll_x;
+    let buf = frame.buffer_mut();
+
+    if vis_data.is_empty() {
+        let msg = if fs.is_empty() {
+            "No profile data yet"
+        } else {
+            "No data for this thread"
+        };
+        let y = area.y + area.height / 2;
+        let x = area.x + (area.width.saturating_sub(msg.len() as u16)) / 2;
+        buf.set_string(
+            x,
+            y,
+            msg,
+            Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
+        );
+        return;
+    }
+
+    for row in 0..lay.num_rows() {
+        let y_start = lay.row_y(row);
+        if y_start >= lay.bottom() {
+            break;
+        }
+
+        let label_y = y_start + lay.cell_h / 2;
+        if label_y < lay.bottom() {
+            buf.set_string(
+                lay.label_x(),
+                label_y,
+                &format!("{:>3}ms ", lay.ms_label(row)),
+                Style::default().fg(DIM),
+            );
+        }
+
+        for col_off in 0..lay.visible_cols {
+            let col = scroll_x + col_off;
+            let value = vis_data.get(col).map_or(0, |c| c[row]);
+            let is_cursor = col == cursor_col && row == cursor_row;
+
+            if value == 0 && !is_cursor {
+                continue;
+            }
+
+            let bg = if value > 0 && peak > 0 {
+                let base = heatmap_color(value, peak);
+                if is_cursor { lighten(base, 50) } else { base }
+            } else if is_cursor {
+                Color::Rgb(40, 40, 55)
+            } else {
+                continue;
+            };
+
+            let cell_x = lay.cell_x(col_off);
+            for dy in 0..lay.cell_h {
+                let y = y_start + dy;
+                if y >= lay.bottom() {
+                    break;
+                }
+                for dx in 0..lay.cell_w {
+                    let x = cell_x + dx;
+                    if x >= lay.right() {
+                        break;
+                    }
+                    if let Some(cell) = buf.cell_mut((x, y)) {
+                        cell.set_char(' ');
+                        cell.set_style(Style::default().bg(bg));
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn render_exe_status_bar(status: Option<&str>, frame: &mut Frame, area: Rect) {
@@ -894,6 +1075,17 @@ const SEARCH_KEYS: &[(&str, &str)] = &[
     ("[Esc]", " cancel "),
     ("[Enter]", " select "),
     ("[↑↓]", " navigate "),
+];
+
+const FLAMESCOPE_KEYS: &[(&str, &str)] = &[
+    ("[Tab]", " switch "),
+    ("[q]", " quit "),
+    ("[h/← l/→]", " time "),
+    ("[j/↓ k/↑]", " offset "),
+    ("[/]", " filter "),
+    ("[Esc]", " unfilter "),
+    ("[G]", " latest "),
+    ("[r]", " reset "),
 ];
 
 const EXE_KEYS: &[(&str, &str)] = &[

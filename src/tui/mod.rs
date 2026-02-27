@@ -9,6 +9,7 @@ use crate::error::Result;
 pub(crate) mod event;
 pub(crate) mod state;
 
+mod flamescope_layout;
 mod ui;
 
 type Backend = CrosstermBackend<io::Stderr>;

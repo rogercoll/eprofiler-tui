@@ -30,3 +30,7 @@ directories = "6.0.0"
 
 [dev-dependencies]
 tokio-stream = { version = "0.1.18", features = ["net"] }
+
+[[example]]
+name = "sleep-pattern-flamescope"
+path = "examples/sleep_pattern.rs"
