@@ -29,6 +29,7 @@ zerocopy = { version = "0.8", features = ["derive"] }
 directories = "6.0.0"
 
 [dev-dependencies]
+tempfile = "3.26.0"
 tokio-stream = { version = "0.1.18", features = ["net"] }
 
 [[example]]

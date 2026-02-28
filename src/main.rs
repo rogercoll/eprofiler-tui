@@ -62,7 +62,7 @@ fn main() -> Result<()> {
         move || {
             let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
             rt.block_on(async {
-                if let Err(e) = grpc::start_server(events, &listen_addr, Some(store)).await {
+                if let Err(e) = grpc::start_server(events, &listen_addr, store).await {
                     eprintln!("gRPC server error: {e}");
                 }
             });
@@ -146,8 +146,7 @@ fn main() -> Result<()> {
                         state.exe.update_symbolized(target_name, info);
                     }
                     Err(err) => {
-                        state.exe.status =
-                            Some(format!("Error loading {}: {}", target_name, err))
+                        state.exe.status = Some(format!("Error loading {}: {}", target_name, err))
                     }
                 };
             }

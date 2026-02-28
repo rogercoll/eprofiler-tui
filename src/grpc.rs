@@ -11,12 +11,12 @@ use eprofiler_proto::opentelemetry::proto::profiles::v1development as profiles;
 
 pub struct ProfilesServer {
     event_tx: mpsc::Sender<Event>,
-    store: Option<Arc<SymbolStore>>,
+    store: Arc<SymbolStore>,
     known_basenames: Arc<RwLock<HashSet<String>>>,
 }
 
 impl ProfilesServer {
-    pub fn new(event_tx: mpsc::Sender<Event>, store: Option<Arc<SymbolStore>>) -> Self {
+    pub fn new(event_tx: mpsc::Sender<Event>, store: Arc<SymbolStore>) -> Self {
         Self {
             event_tx,
             store,
@@ -34,29 +34,79 @@ fn unknown_basenames(
         .skip(1)
         .fold(Vec::new(), |mut names, mapping| {
             let name_idx = mapping.filename_strindex as usize;
-            if name_idx == 0 || name_idx >= dict.string_table.len() {
-                return names;
-            }
-            let full_path = &dict.string_table[name_idx];
-            if !full_path.is_empty() && !known.read().unwrap().contains(full_path) {
-                let basename = full_path.rsplit('/').next().unwrap_or(full_path);
-                if !basename.is_empty() && !basename.starts_with('[') {
-                    known.write().unwrap().insert(full_path.to_string());
-                    names.push(basename.to_string());
+            if name_idx != 0 && name_idx < dict.string_table.len() {
+                let full_path = &dict.string_table[name_idx];
+                if !full_path.is_empty() && !known.read().unwrap().contains(full_path) {
+                    let basename = full_path.rsplit('/').next().unwrap_or(full_path);
+                    if !basename.is_empty() && !basename.starts_with('[') {
+                        known.write().unwrap().insert(full_path.to_string());
+                        names.push(basename.to_string());
+                    }
                 }
             }
             names
         })
 }
 
+/// Pre-resolves the location table into human-readable strings.
+/// This turns a complex Protobuf traversal into a simple O(1) vector lookup.
+fn pre_resolve_locations(dict: &profiles::ProfilesDictionary, store: &SymbolStore) -> Vec<String> {
+    dict.location_table
+        .iter()
+        .map(|location| {
+            let frame_tag = resolve_frame_type(location, dict);
+            if location.lines.is_empty() {
+                // Try native symbolication
+                if frame_tag == "Native" {
+                    if let Some(names) = symbolize_native(store, location, dict) {
+                        // Join inlined native frames into one string for the cache
+                        return names
+                            .iter()
+                            .enumerate()
+                            .map(|(i, n)| {
+                                format!("{} [Native]{}", n, if i > 0 { " [Inline]" } else { "" })
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" / ");
+                    }
+                }
+                format_with_tag(&resolve_unsymbolized_label(location, dict), &frame_tag)
+            } else {
+                // Resolve known lines
+                location
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .map(|(i, line)| {
+                        let func_name = resolve_function_name(line, dict);
+                        format!(
+                            "{} [{}]{}",
+                            func_name,
+                            frame_tag,
+                            if i > 0 { " [Inline]" } else { "" }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            }
+        })
+        .collect()
+}
+
 fn process_export(
     req: collector::ExportProfilesServiceRequest,
-    store: Option<&SymbolStore>,
+    store: &SymbolStore,
     known: &RwLock<HashSet<String>>,
     event_tx: &mpsc::Sender<Event>,
 ) {
     let mut flamegraph = FlameGraph::new();
-    let dict = req.dictionary.as_ref();
+    let Some(dict) = req.dictionary.as_ref() else {
+        // return, no string data can be referenced
+        return;
+    };
+
+    let mut stack_cache: HashMap<i32, Vec<String>> = HashMap::new();
+    let location_cache = pre_resolve_locations(dict, store);
 
     let mut sample_count: u64 = 0;
     let mut thread_timestamps: HashMap<String, Vec<u64>> = HashMap::new();
@@ -65,39 +115,53 @@ fn process_export(
         for scope_profiles in &resource_profiles.scope_profiles {
             for profile in &scope_profiles.profiles {
                 for sample in &profile.samples {
-                    let stack = resolve_stack(sample, dict, store);
-                    if stack.is_empty() {
-                        continue;
-                    }
+                    let stack = stack_cache.entry(sample.stack_index).or_insert_with(|| {
+                        let idx = sample.stack_index as usize;
+                        if idx == 0 || idx >= dict.stack_table.len() {
+                            return Vec::new();
+                        }
 
-                    let value = if !sample.timestamps_unix_nano.is_empty() {
-                        sample.timestamps_unix_nano.len() as i64
-                    } else if !sample.values.is_empty() {
-                        sample.values.iter().sum::<i64>().max(1)
-                    } else {
-                        1
-                    };
+                        let mut frames = Vec::new();
+                        for &loc_idx in &dict.stack_table[idx].location_indices {
+                            let loc_idx = loc_idx as usize;
+                            if loc_idx < location_cache.len() {
+                                frames.push(location_cache[loc_idx].clone());
+                            }
+                        }
+                        frames.reverse(); // Standard pprof leaf-to-root reversal
 
-                    if !sample.timestamps_unix_nano.is_empty() {
-                        thread_timestamps
-                            .entry(stack[0].clone())
-                            .or_default()
-                            .extend_from_slice(&sample.timestamps_unix_nano);
+                        let comm = resolve_thread_name(sample, dict);
+                        let mut result = Vec::with_capacity(frames.len() + 1);
+                        result.push(comm);
+                        result.extend(frames);
+                        result
+                    });
+
+                    if !stack.is_empty() {
+                        let value = if !sample.timestamps_unix_nano.is_empty() {
+                            thread_timestamps
+                                .entry(stack[0].clone())
+                                .or_default()
+                                .extend_from_slice(&sample.timestamps_unix_nano);
+                            sample.timestamps_unix_nano.len() as i64
+                        } else if !sample.values.is_empty() {
+                            sample.values.iter().sum::<i64>().max(1)
+                        } else {
+                            1
+                        };
+
+                        flamegraph.add_stack(&stack, value);
+                        sample_count += value as u64;
                     }
-                    flamegraph.add_stack(&stack, value);
-                    sample_count += value as u64;
                 }
             }
         }
     }
 
-    if let Some(dict) = dict {
-        let basenames = unknown_basenames(known, dict);
-        if !basenames.is_empty() {
-            let _ = event_tx.send(Event::MappingsDiscovered(basenames));
-        }
+    let basenames = unknown_basenames(known, dict);
+    if !basenames.is_empty() {
+        let _ = event_tx.send(Event::MappingsDiscovered(basenames));
     }
-
     let _ = event_tx.send(Event::ProfileUpdate {
         flamegraph,
         samples: sample_count,
@@ -111,90 +175,24 @@ impl collector::profiles_service_server::ProfilesService for ProfilesServer {
         &self,
         request: Request<collector::ExportProfilesServiceRequest>,
     ) -> Result<Response<collector::ExportProfilesServiceResponse>, Status> {
-        let req = request.into_inner();
-        let store = self.store.clone();
-        let known = Arc::clone(&self.known_basenames);
-        let tx = self.event_tx.clone();
-
-        tokio::task::spawn_blocking(move || {
-            process_export(req, store.as_deref(), &known, &tx);
+        tokio::task::spawn_blocking({
+            let store = self.store.clone();
+            let known_basenames = Arc::clone(&self.known_basenames);
+            let event_tx = self.event_tx.clone();
+            move || {
+                process_export(
+                    request.into_inner(),
+                    store.as_ref(),
+                    &known_basenames,
+                    &event_tx,
+                );
+            }
         });
 
         Ok(Response::new(collector::ExportProfilesServiceResponse {
             partial_success: None,
         }))
     }
-}
-
-fn resolve_stack(
-    sample: &profiles::Sample,
-    dict: Option<&profiles::ProfilesDictionary>,
-    store: Option<&SymbolStore>,
-) -> Vec<String> {
-    let Some(dict) = dict else {
-        return vec![];
-    };
-
-    let stack_idx = sample.stack_index as usize;
-    if stack_idx == 0 || stack_idx >= dict.stack_table.len() {
-        return vec![];
-    }
-
-    let stack = &dict.stack_table[stack_idx];
-    let mut frames: Vec<String> = Vec::new();
-
-    for &loc_idx in &stack.location_indices {
-        let loc_idx = loc_idx as usize;
-        if loc_idx == 0 || loc_idx >= dict.location_table.len() {
-            continue;
-        }
-        let location = &dict.location_table[loc_idx];
-        let frame_tag = resolve_frame_type(location, dict);
-
-        if location.lines.is_empty() {
-            let mut symbolized = false;
-
-            if frame_tag == "Native" {
-                if let Some(store) = store {
-                    if let Some(sym_names) = symbolize_native(store, location, dict) {
-                        for (i, name) in sym_names.iter().enumerate() {
-                            let suffix = if i > 0 { " [Inline]" } else { "" };
-                            frames.push(format!("{} [Native]{}", name, suffix));
-                        }
-                        symbolized = true;
-                    }
-                }
-            }
-
-            if !symbolized {
-                let label = resolve_unsymbolized_label(location, dict);
-                frames.push(format_with_tag(&label, &frame_tag));
-            }
-        } else {
-            for (i, line) in location.lines.iter().enumerate() {
-                let func_name = resolve_function_name(line, dict);
-                let inline_suffix = if i > 0 { " [Inline]" } else { "" };
-                frames.push(format!(
-                    "{}{}{}",
-                    func_name,
-                    if frame_tag.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" [{}]", frame_tag)
-                    },
-                    inline_suffix,
-                ));
-            }
-        }
-    }
-
-    frames.reverse();
-
-    let comm = resolve_thread_name(sample, dict);
-    let mut result = Vec::with_capacity(frames.len() + 1);
-    result.push(comm);
-    result.extend(frames);
-    result
 }
 
 /// Try to symbolize a native frame via the local symbol store.
@@ -295,7 +293,7 @@ fn resolve_frame_type(
             }
         }
     }
-    String::new()
+    String::from("Unknown")
 }
 
 fn format_with_tag(label: &str, tag: &str) -> String {
@@ -334,7 +332,7 @@ fn resolve_thread_name(sample: &profiles::Sample, dict: &profiles::ProfilesDicti
 pub async fn start_server(
     event_tx: mpsc::Sender<Event>,
     addr: &str,
-    store: Option<Arc<SymbolStore>>,
+    store: Arc<SymbolStore>,
 ) -> Result<(), tonic::transport::Error> {
     let addr = addr.parse().expect("invalid gRPC listen address");
     let server = ProfilesServer::new(event_tx, store);
@@ -366,8 +364,11 @@ mod tests {
     async fn setup_server(tx: mpsc::Sender<Event>) -> u16 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::storage::SymbolStore::open(tmp.path()).unwrap());
         tokio::spawn(async move {
-            let server = ProfilesServer::new(tx, None);
+            let _tmp = tmp; // keep tempdir alive for the server's lifetime
+            let server = ProfilesServer::new(tx, store);
             tonic::transport::Server::builder()
                 .add_service(collector::profiles_service_server::ProfilesServiceServer::new(server))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
@@ -478,8 +479,8 @@ mod tests {
                 let thread = &flamegraph.root.children[0];
                 assert_eq!(thread.name, "worker-1");
                 assert_eq!(thread.total_value, 10);
-                assert_eq!(thread.children[0].name, "main");
-                assert_eq!(thread.children[0].children[0].name, "do_work");
+                assert_eq!(thread.children[0].name, "main [Unknown]");
+                assert_eq!(thread.children[0].children[0].name, "do_work [Unknown]");
             }
             _ => panic!("expected ProfileUpdate event"),
         }
