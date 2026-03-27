@@ -223,7 +223,7 @@ fn render_waiting(frame: &mut Frame, area: Rect, listen_addr: &str) {
     buf.set_string(
         sep_x,
         base_y + 1,
-        &"─".repeat(sep_len as usize),
+        "─".repeat(sep_len as usize),
         Style::default().fg(SEP_COLOR).bg(BG),
     );
 
@@ -525,16 +525,17 @@ fn render_flamegraph(fg: &mut FlamegraphTab, frame: &mut Frame, area: Rect) {
             }
         }
 
-        if is_cursor && fr.width >= 3 {
-            if let Some(cell) = buf.cell_mut((area.x + fr.x + 1, screen_y)) {
-                cell.set_char('▸');
-                cell.set_style(
-                    Style::default()
-                        .fg(Color::White)
-                        .bg(bg)
-                        .add_modifier(Modifier::BOLD),
-                );
-            }
+        if is_cursor
+            && fr.width >= 3
+            && let Some(cell) = buf.cell_mut((area.x + fr.x + 1, screen_y))
+        {
+            cell.set_char('▸');
+            cell.set_style(
+                Style::default()
+                    .fg(Color::White)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+            );
         }
     }
 
@@ -677,7 +678,7 @@ fn render_flamescope(fs: &mut FlamescopeTab, frame: &mut Frame, area: Rect) {
             buf.set_string(
                 lay.label_x(),
                 label_y,
-                &format!("{:>3}ms ", lay.ms_label(row)),
+                format!("{:>3}ms ", lay.ms_label(row)),
                 Style::default().fg(DIM),
             );
         }
@@ -862,7 +863,7 @@ fn render_exe_table(exe: &mut ExecutablesTab, frame: &mut Frame, area: Rect) {
         buf.set_string(
             area.x + 1 + col_id_w,
             y,
-            &format!("{prefix}{name}"),
+            format!("{prefix}{name}"),
             name_style,
         );
 
@@ -933,7 +934,7 @@ fn render_overlay(frame: &mut Frame, area: Rect, props: &OverlayProps) {
     buf.set_string(
         popup.x + 1,
         popup.y + 1,
-        &truncate(&prompt, inner_w),
+        truncate(&prompt, inner_w),
         Style::reset().fg(BRIGHT),
     );
 

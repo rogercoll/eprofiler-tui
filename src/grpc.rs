@@ -57,18 +57,18 @@ fn pre_resolve_locations(dict: &profiles::ProfilesDictionary, store: &SymbolStor
             let frame_tag = resolve_frame_type(location, dict);
             if location.lines.is_empty() {
                 // Try native symbolication
-                if frame_tag == "Native" {
-                    if let Some(names) = symbolize_native(store, location, dict) {
-                        // Join inlined native frames into one string for the cache
-                        return names
-                            .iter()
-                            .enumerate()
-                            .map(|(i, n)| {
-                                format!("{} [Native]{}", n, if i > 0 { " [Inline]" } else { "" })
-                            })
-                            .collect::<Vec<_>>()
-                            .join(" / ");
-                    }
+                if frame_tag == "Native"
+                    && let Some(names) = symbolize_native(store, location, dict)
+                {
+                    // Join inlined native frames into one string for the cache
+                    return names
+                        .iter()
+                        .enumerate()
+                        .map(|(i, n)| {
+                            format!("{} [Native]{}", n, if i > 0 { " [Inline]" } else { "" })
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" / ");
                 }
                 format_with_tag(&resolve_unsymbolized_label(location, dict), &frame_tag)
             } else {
@@ -150,7 +150,7 @@ fn process_export(
                             1
                         };
 
-                        flamegraph.add_stack(&stack, value);
+                        flamegraph.add_stack(stack, value);
                         sample_count += value as u64;
                     }
                 }
@@ -274,23 +274,23 @@ fn resolve_frame_type(
         if dict.string_table[key_idx] != "profile.frame.type" {
             continue;
         }
-        if let Some(ref value) = attr.value {
-            if let Some(common::any_value::Value::StringValue(ref s)) = value.value {
-                return match s.as_str() {
-                    "native" => "Native".to_string(),
-                    "kernel" => "Kernel".to_string(),
-                    "jvm" => "JVM".to_string(),
-                    "cpython" => "Python".to_string(),
-                    "php" | "phpjit" => "PHP".to_string(),
-                    "ruby" => "Ruby".to_string(),
-                    "perl" => "Perl".to_string(),
-                    "v8js" => "JS".to_string(),
-                    "dotnet" => ".NET".to_string(),
-                    "beam" => "Beam".to_string(),
-                    "go" => "Go".to_string(),
-                    other => other.to_string(),
-                };
-            }
+        if let Some(ref value) = attr.value
+            && let Some(common::any_value::Value::StringValue(ref s)) = value.value
+        {
+            return match s.as_str() {
+                "native" => "Native".to_string(),
+                "kernel" => "Kernel".to_string(),
+                "jvm" => "JVM".to_string(),
+                "cpython" => "Python".to_string(),
+                "php" | "phpjit" => "PHP".to_string(),
+                "ruby" => "Ruby".to_string(),
+                "perl" => "Perl".to_string(),
+                "v8js" => "JS".to_string(),
+                "dotnet" => ".NET".to_string(),
+                "beam" => "Beam".to_string(),
+                "go" => "Go".to_string(),
+                other => other.to_string(),
+            };
         }
     }
     String::from("Unknown")
@@ -316,14 +316,12 @@ fn resolve_thread_name(sample: &profiles::Sample, dict: &profiles::ProfilesDicti
             continue;
         }
         let key = &dict.string_table[key_idx];
-        if key == "thread.name" {
-            if let Some(ref value) = attr.value {
-                if let Some(common::any_value::Value::StringValue(ref s)) = value.value {
-                    if !s.is_empty() {
-                        return s.clone();
-                    }
-                }
-            }
+        if key == "thread.name"
+            && let Some(ref value) = attr.value
+            && let Some(common::any_value::Value::StringValue(ref s)) = value.value
+            && !s.is_empty()
+        {
+            return s.clone();
         }
     }
     "[unknown]".to_string()

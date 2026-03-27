@@ -166,10 +166,10 @@ impl FlamegraphTab {
                 .children
                 .len()
         };
-        if let Some(last) = self.cursor_path.last_mut() {
-            if *last + 1 < sibling_count {
-                *last += 1;
-            }
+        if let Some(last) = self.cursor_path.last_mut()
+            && *last + 1 < sibling_count
+        {
+            *last += 1;
         }
     }
 

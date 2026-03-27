@@ -155,10 +155,10 @@ impl ExecutablesTab {
                 }
             }
             KeyCode::Char('r') => {
-                if let Some(entry) = self.list.get(self.cursor) {
-                    if let Some(file_id) = entry.file_id {
-                        return Action::RemoveSymbols(entry.name.clone(), file_id);
-                    }
+                if let Some(entry) = self.list.get(self.cursor)
+                    && let Some(file_id) = entry.file_id
+                {
+                    return Action::RemoveSymbols(entry.name.clone(), file_id);
                 }
             }
             KeyCode::Char('/') => self.path_input.open(None),

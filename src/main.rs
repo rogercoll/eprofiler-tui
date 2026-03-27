@@ -98,7 +98,7 @@ fn main() -> Result<()> {
                                 info: symbolizer::extract_symbols(&path).and_then(|file_sym| {
                                     let info = storage::ExecutableInfo {
                                         file_id: file_sym.file_id,
-                                        file_name: file_name,
+                                        file_name,
                                         num_ranges: file_sym.ranges.len() as u32,
                                     };
                                     store.store_file_symbols(&file_sym, &path)?;
@@ -114,10 +114,10 @@ fn main() -> Result<()> {
                         let sender = tui.events.sender.clone();
                         let store = Arc::clone(&store);
                         move || {
-                            sender.send(Event::SymbolsRemoved {
-                                name: name,
+                            Box::new(sender.send(Event::SymbolsRemoved {
+                                name,
                                 error: store.remove_file_symbols(file_id).err(),
-                            })
+                            }))
                         }
                     });
                 }
