@@ -29,7 +29,8 @@ jobs:
     needs: changelog
     if: |
       contains(needs.changelog.outputs.changelog, 'src') ||
-      contains(needs.changelog.outputs.changelog, 'Cargo.toml')
+      contains(needs.changelog.outputs.changelog, 'Cargo.toml') ||
+      contains(needs.changelog.outputs.changelog, '.github/workflows')
 
     steps:
       - name: Checkout code
@@ -64,7 +65,8 @@ jobs:
     if: |
       contains(needs.changelog.outputs.changelog, 'src') ||
       contains(needs.changelog.outputs.changelog, 'Cargo.toml') ||
-      contains(needs.changelog.outputs.changelog, 'Containerfile')
+      contains(needs.changelog.outputs.changelog, 'Containerfile') ||
+      contains(needs.changelog.outputs.changelog, '.github/workflows')
 
     steps:
       - name: Checkout code
