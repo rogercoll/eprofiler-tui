@@ -1,11 +1,7 @@
+use std::fs;
 use std::path::PathBuf;
-use std::{env, fs};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if env::var("REBUILD_PROTO").is_err() {
-        return Ok(());
-    }
-
     let out_dir = PathBuf::from("./src/gen");
     fs::create_dir_all(&out_dir)?;
 

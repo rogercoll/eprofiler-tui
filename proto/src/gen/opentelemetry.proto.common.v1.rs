@@ -6,7 +6,7 @@
 pub struct AnyValue {
     /// The value is one of the listed fields. It is valid for all values to be unspecified
     /// in which case this AnyValue is considered to be "empty".
-    #[prost(oneof = "any_value::Value", tags = "1, 2, 3, 4, 5, 6, 7")]
+    #[prost(oneof = "any_value::Value", tags = "1, 2, 3, 4, 5, 6, 7, 8")]
     pub value: ::core::option::Option<any_value::Value>,
 }
 /// Nested message and enum types in `AnyValue`.
@@ -29,6 +29,18 @@ pub mod any_value {
         KvlistValue(super::KeyValueList),
         #[prost(bytes, tag = "7")]
         BytesValue(::prost::alloc::vec::Vec<u8>),
+        /// Reference to the string value in ProfilesDictionary.string_table.
+        ///
+        /// Note: This is currently used exclusively in the Profiling signal.
+        /// Implementers of OTLP receivers for signals other than Profiling should
+        /// treat the presence of this value as a non-fatal issue.
+        /// Log an error or warning indicating an unexpected field intended for the
+        /// Profiling signal and process the data as if this value were absent or
+        /// empty, ignoring its semantic content for the non-Profiling signal.
+        ///
+        /// Status: \[Alpha\]
+        #[prost(int32, tag = "8")]
+        StringValueStrindex(i32),
     }
 }
 /// ArrayValue is a list of AnyValue messages. We need ArrayValue as a message
@@ -60,11 +72,25 @@ pub struct KeyValueList {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct KeyValue {
     /// The key name of the pair.
+    /// key_strindex MUST NOT be set if key is used.
     #[prost(string, tag = "1")]
     pub key: ::prost::alloc::string::String,
     /// The value of the pair.
     #[prost(message, optional, tag = "2")]
     pub value: ::core::option::Option<AnyValue>,
+    /// Reference to the string key in ProfilesDictionary.string_table.
+    /// key MUST NOT be set if key_strindex is used.
+    ///
+    /// Note: This is currently used exclusively in the Profiling signal.
+    /// Implementers of OTLP receivers for signals other than Profiling should
+    /// treat the presence of this key as a non-fatal issue.
+    /// Log an error or warning indicating an unexpected field intended for the
+    /// Profiling signal and process the data as if this value were absent or
+    /// empty, ignoring its semantic content for the non-Profiling signal.
+    ///
+    /// Status: \[Alpha\]
+    #[prost(int32, tag = "3")]
+    pub key_strindex: i32,
 }
 /// InstrumentationScope is a message representing the instrumentation scope information
 /// such as the fully qualified name and version.

@@ -22,6 +22,8 @@
 /// * There SHOULD NOT be orphaned (unreferenced) items in a dictionary. A
 ///   profile processor may remove ("garbage-collect") orphaned items and this
 ///   MUST NOT have any observable effects for consumers.
+///
+/// Status: \[Alpha\]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ProfilesDictionary {
     /// Mappings from address ranges to the image/binary/library mapped
@@ -88,6 +90,8 @@ pub struct ProfilesDictionary {
 ///
 /// When new fields are added into this message, the OTLP request MUST be updated
 /// as well.
+///
+/// Status: \[Alpha\]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ProfilesData {
     /// An array of ResourceProfiles.
@@ -106,6 +110,8 @@ pub struct ProfilesData {
     pub dictionary: ::core::option::Option<ProfilesDictionary>,
 }
 /// A collection of ScopeProfiles from a Resource.
+///
+/// Status: \[Alpha\]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ResourceProfiles {
     /// The resource for the profiles in this message.
@@ -125,6 +131,8 @@ pub struct ResourceProfiles {
     pub schema_url: ::prost::alloc::string::String,
 }
 /// A collection of Profiles produced by an InstrumentationScope.
+///
+/// Status: \[Alpha\]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ScopeProfiles {
     /// The instrumentation scope information for the profiles in this message.
@@ -152,6 +160,8 @@ pub struct ScopeProfiles {
 /// Note that whilst fields in this message retain the name and field id from pprof in most cases
 /// for ease of understanding data migration, it is not intended that pprof:Profile and
 /// OpenTelemetry:Profile encoding be wire compatible.
+///
+/// Status: \[Alpha\]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Profile {
     /// The type and unit of all Sample.values in this profile.
@@ -164,10 +174,15 @@ pub struct Profile {
     /// The set of samples recorded in this profile.
     #[prost(message, repeated, tag = "2")]
     pub samples: ::prost::alloc::vec::Vec<Sample>,
-    /// Time of collection (UTC) represented as nanoseconds past the epoch.
+    /// Time of collection. Value is UNIX Epoch time in nanoseconds since 00:00:00
+    /// UTC on 1 January 1970.
     #[prost(fixed64, tag = "3")]
     pub time_unix_nano: u64,
-    /// Duration of the profile, if a duration makes sense.
+    /// Duration of the profile. For instant profiles like live heap snapshot, the
+    /// duration can be zero but it may be preferable to set time_unix_nano to the
+    /// process start time and duration_nano to the relative time when the profile
+    /// was gathered. This ensures Sample.timestamps_unix_nano values such as
+    /// allocation timestamp fall into the profile time range.
     #[prost(uint64, tag = "4")]
     pub duration_nano: u64,
     /// The kind of events between sampled occurrences.
@@ -221,6 +236,8 @@ pub struct Profile {
 }
 /// A pointer from a profile Sample to a trace Span.
 /// Connects a profile sample to a trace span, identified by unique trace and span IDs.
+///
+/// Status: \[Alpha\]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Link {
     /// A unique identifier of a trace that this linked span is part of. The ID is a
@@ -232,6 +249,8 @@ pub struct Link {
     pub span_id: ::prost::alloc::vec::Vec<u8>,
 }
 /// ValueType describes the type and units of a value.
+///
+/// Status: \[Alpha\]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ValueType {
     /// Index into ProfilesDictionary.string_table.
@@ -250,7 +269,11 @@ pub struct ValueType {
 /// both fields are populated, they MUST contain the same number of elements, and
 /// the elements at the same index MUST refer to the same event.
 ///
-/// Examples of different ways of representing a sample with the total value of 10:
+/// For the purposes of efficiently representing aggregated data observations, a Sample is regarded
+/// as having a shared identity and an associated collection of per-observation data points.
+/// Samples having the same identity SHOULD be combined by inserting timestamps and values to the data arrays.
+///
+/// Examples of different ways ('shapes') of representing a sample with the total value of 10:
 ///
 /// Report of a stacktrace at 10 timestamps (consumers must assume the value is 1 for each point):
 /// values: \[\]
@@ -263,28 +286,37 @@ pub struct ValueType {
 /// Report of a stacktrace at 4 timestamps where each point records a specific value:
 /// values: \[2, 2, 3, 3\]
 /// timestamps_unix_nano: \[1, 2, 3, 4\]
+///
+/// All Samples for a Profile SHOULD have the same shape, i.e. all data observation series should consistently
+/// adopt the same data recording style.
+///
+/// Status: \[Alpha\]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Sample {
     /// Reference to stack in ProfilesDictionary.stack_table.
     #[prost(int32, tag = "1")]
     pub stack_index: i32,
-    /// The type and unit of each value is defined by Profile.sample_type.
-    #[prost(int64, repeated, tag = "2")]
-    pub values: ::prost::alloc::vec::Vec<i64>,
     /// References to attributes in ProfilesDictionary.attribute_table. \[optional\]
-    #[prost(int32, repeated, tag = "3")]
+    #[prost(int32, repeated, tag = "2")]
     pub attribute_indices: ::prost::alloc::vec::Vec<i32>,
     /// Reference to link in ProfilesDictionary.link_table. \[optional\]
     /// It can be unset / set to 0 if no link exists, as link_table\[0\] is always a 'null' default value.
-    #[prost(int32, tag = "4")]
+    #[prost(int32, tag = "3")]
     pub link_index: i32,
-    /// Timestamps associated with Sample represented in nanoseconds. These
-    /// timestamps should fall within the Profile's time range.
+    /// The type and unit of each value is defined by Profile.sample_type.
+    #[prost(int64, repeated, tag = "4")]
+    pub values: ::prost::alloc::vec::Vec<i64>,
+    /// Timestamps associated with Sample. Value is UNIX Epoch time in nanoseconds
+    /// since 00:00:00 UTC on 1 January 1970. The timestamps should fall within the
+    /// \[Profile.time_unix_nano, Profile.time_unix_nano + Profile.duration_nano)
+    /// time range.
     #[prost(fixed64, repeated, tag = "5")]
     pub timestamps_unix_nano: ::prost::alloc::vec::Vec<u64>,
 }
 /// Describes the mapping of a binary in memory, including its address range,
 /// file offset, and metadata like build ID
+///
+/// Status: \[Alpha\]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Mapping {
     /// Address at which the binary (or DLL) is loaded into memory.
@@ -308,6 +340,8 @@ pub struct Mapping {
     pub attribute_indices: ::prost::alloc::vec::Vec<i32>,
 }
 /// A Stack represents a stack trace as a list of locations.
+///
+/// Status: \[Alpha\]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Stack {
     /// References to locations in ProfilesDictionary.location_table.
@@ -316,6 +350,8 @@ pub struct Stack {
     pub location_indices: ::prost::alloc::vec::Vec<i32>,
 }
 /// Describes function and line table debug information.
+///
+/// Status: \[Alpha\]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Location {
     /// Reference to mapping in ProfilesDictionary.mapping_table.
@@ -344,6 +380,8 @@ pub struct Location {
     pub attribute_indices: ::prost::alloc::vec::Vec<i32>,
 }
 /// Details a specific line in a source code, linked to a function.
+///
+/// Status: \[Alpha\]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Line {
     /// Reference to function in ProfilesDictionary.function_table.
@@ -358,6 +396,8 @@ pub struct Line {
 }
 /// Describes a function, including its human-readable name, system name,
 /// source file, and starting line number in the source.
+///
+/// Status: \[Alpha\]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Function {
     /// The function name. Empty string if not available.
@@ -377,6 +417,8 @@ pub struct Function {
 /// A custom 'dictionary native' style of encoding attributes which is more convenient
 /// for profiles than opentelemetry.proto.common.v1.KeyValue
 /// Specifically, uses the string table for keys and allows optional unit information.
+///
+/// Status: \[Alpha\]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct KeyValueAndUnit {
     /// The index into the string table for the attribute's key.
