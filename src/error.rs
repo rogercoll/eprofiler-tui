@@ -20,6 +20,6 @@ pub enum Error {
     SymConv(#[from] symblib::symbconv::Error),
     #[error("storage error: {0}")]
     Storage(#[from] fjall::Error),
-    #[error("incompatible storage format at `{}`: delete the directory and restart\n  rm -rf {}", .0.display(), .0.display())]
+    #[error("incompatible storage format at `{}`: delete the directory and restart", .0.display())]
     StorageVersionMismatch(PathBuf),
 }
