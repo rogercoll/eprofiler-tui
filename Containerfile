@@ -1,4 +1,4 @@
-FROM rust:1.88-slim-bullseye AS builder
+FROM rust:1.90-slim-bullseye AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends cmake g++ make protobuf-compiler && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
