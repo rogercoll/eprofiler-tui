@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::RwLock;
 
-use fjall::{Keyspace, PartitionHandle};
+use fjall::{Database, Keyspace, KeyspaceCreateOptions};
 use symblib::VirtAddr;
 pub use symblib::fileid::FileId;
 use zerocopy::byteorder::{BigEndian, U16, U32, U64, U128};
@@ -115,22 +115,27 @@ pub struct ExecutableInfo {
 ///   - **strings**: `StringKey -> raw UTF-8` (fixed 20-byte key, variable value)
 ///   - **files**: `U128<BE> -> num_ranges(4) + filename` (executable metadata)
 pub struct SymbolStore {
-    keyspace: Keyspace,
-    ranges: PartitionHandle,
-    strings: PartitionHandle,
-    files: PartitionHandle,
+    db: Database,
+    ranges: Keyspace,
+    strings: Keyspace,
+    files: Keyspace,
     basename_index: RwLock<HashMap<String, FileId>>,
 }
 
 impl SymbolStore {
     pub fn open(path: impl AsRef<Path>) -> crate::Result<Self> {
-        let keyspace = fjall::Config::new(path).open()?;
-        let ranges = keyspace.open_partition("ranges", Default::default())?;
-        let strings = keyspace.open_partition("strings", Default::default())?;
-        let files = keyspace.open_partition("files", Default::default())?;
+        let db = Database::builder(path.as_ref()).open().map_err(|e| match e {
+            fjall::Error::InvalidVersion(_) => {
+                crate::error::Error::StorageVersionMismatch(path.as_ref().to_path_buf())
+            }
+            other => other.into(),
+        })?;
+        let ranges = db.keyspace("ranges", KeyspaceCreateOptions::default)?;
+        let strings = db.keyspace("strings", KeyspaceCreateOptions::default)?;
+        let files = db.keyspace("files", KeyspaceCreateOptions::default)?;
 
         let store = Self {
-            keyspace,
+            db,
             ranges,
             strings,
             files,
@@ -153,7 +158,7 @@ impl SymbolStore {
     /// Atomically persist all ranges, interned strings, and file metadata.
     pub fn store_file_symbols(&self, file_sym: &FileSym, path: &Path) -> crate::Result<()> {
         let fid: u128 = file_sym.file_id.into();
-        let mut batch = self.keyspace.batch();
+        let mut batch = self.db.batch();
 
         for (idx, s) in file_sym.strings.iter().enumerate() {
             batch.insert(
@@ -204,12 +209,12 @@ impl SymbolStore {
 
         let mut frames = Vec::new();
 
-        for item in self.ranges.range(lower.as_bytes()..=upper.as_bytes()).rev() {
-            let kv = item?;
-            let Ok(key) = RangeKey::ref_from_bytes(&kv.0) else {
+        for guard in self.ranges.range(lower.as_bytes()..=upper.as_bytes()).rev() {
+            let (kb, vb) = guard.into_inner()?;
+            let Ok(key) = RangeKey::ref_from_bytes(&kb) else {
                 continue;
             };
-            let Ok(val) = RangeValue::ref_from_bytes(&kv.1) else {
+            let Ok(val) = RangeValue::ref_from_bytes(&vb) else {
                 continue;
             };
 
@@ -250,8 +255,8 @@ impl SymbolStore {
     /// List all stored executables.
     pub fn list_files(&self) -> crate::Result<Vec<ExecutableInfo>> {
         let mut result = Vec::new();
-        for item in self.files.range::<Vec<u8>, _>(..) {
-            let (kb, vb) = item?;
+        for guard in self.files.range::<Vec<u8>, _>(..) {
+            let (kb, vb) = guard.into_inner()?;
             if let Some(info) = parse_file_meta(&kb, &vb) {
                 result.push(info);
             }
@@ -265,13 +270,13 @@ impl SymbolStore {
         let prefix = U128::<BigEndian>::new(fid);
         let prefix_bytes = prefix.as_bytes();
 
-        let mut batch = self.keyspace.batch();
+        let mut batch = self.db.batch();
 
-        for item in self.ranges.prefix(prefix_bytes) {
-            batch.remove(&self.ranges, item?.0);
+        for guard in self.ranges.prefix(prefix_bytes) {
+            batch.remove(&self.ranges, guard.key()?);
         }
-        for item in self.strings.prefix(prefix_bytes) {
-            batch.remove(&self.strings, item?.0);
+        for guard in self.strings.prefix(prefix_bytes) {
+            batch.remove(&self.strings, guard.key()?);
         }
         batch.remove(&self.files, prefix_bytes);
         batch.commit()?;

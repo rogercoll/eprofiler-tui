@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(thiserror::Error, Debug)]
@@ -18,4 +20,6 @@ pub enum Error {
     SymConv(#[from] symblib::symbconv::Error),
     #[error("storage error: {0}")]
     Storage(#[from] fjall::Error),
+    #[error("incompatible storage format at `{}`: delete the directory and restart\n  rm -rf {}", .0.display(), .0.display())]
+    StorageVersionMismatch(PathBuf),
 }

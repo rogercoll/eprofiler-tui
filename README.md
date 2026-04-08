@@ -55,7 +55,7 @@ eprofiler-tui --port 4318
 | Option | Description |
 |--------|-------------|
 | `-p`, `--port <PORT>` | OTLP gRPC listen port (default: `4317`) |
-| `-d`, `--data-dir <PATH>` | Symbol store directory (default: platform data dir) |
+| `-d`, `--data-dir <PATH>` | Symbol store directory (default: `~/.local/share/eprofiler-tui` on Linux, `~/Library/Application Support/eprofiler-tui` on macOS) |
 | `-h`, `--help` | Print help |
 
 ## Building

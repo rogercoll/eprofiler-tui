@@ -29,6 +29,8 @@ use crate::tui::state::Action;
 struct Cli {
     #[arg(short, long, default_value_t = 4317)]
     port: u16,
+    /// Symbol store directory (default: $XDG_DATA_HOME/eprofiler-tui,
+    /// typically ~/.local/share/eprofiler-tui on Linux)
     #[arg(short = 'd', long = "data-dir", value_name = "PATH")]
     data_dir: Option<PathBuf>,
 }
