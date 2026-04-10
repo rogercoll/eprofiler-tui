@@ -1,11 +1,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use directories::ProjectDirs;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
+mod debug;
 mod error;
 mod flamegraph;
 mod grpc;
@@ -31,10 +32,27 @@ struct Cli {
     port: u16,
     #[arg(short = 'd', long = "data-dir", value_name = "PATH")]
     data_dir: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Inspect raw OTLP ResourceProfiles one by one
+    Debug {
+        /// Port to listen on (overrides --port)
+        #[arg(short, long)]
+        port: Option<u16>,
+    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if let Some(Commands::Debug { port }) = cli.command {
+        return debug::run(port.unwrap_or(cli.port));
+    }
+
     let listen_addr = format!("0.0.0.0:{}", cli.port);
 
     let storage_path: PathBuf = match cli.data_dir {

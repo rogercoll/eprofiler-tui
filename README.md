@@ -58,6 +58,29 @@ eprofiler-tui --port 4318
 | `-d`, `--data-dir <PATH>` | Symbol store directory (default: platform data dir) |
 | `-h`, `--help` | Print help |
 
+## Debug mode
+
+A standalone profile inspector for troubleshooting profiling pipelines. It receives OTLP profiles on a gRPC endpoint and displays each `ExportProfilesServiceRequest` as a paginated, color-coded view of the raw data — dictionary tables, resource attributes, scope metadata, profile fields, and fully resolved sample stacks.
+
+```
+eprofiler-tui debug
+eprofiler-tui debug --port 4318
+```
+
+![Debug-Demo](./content/assets/debug.gif)
+
+Navigate between requests like pages in a book with `h`/`l`. Each page shows the complete request: string table, mapping table, attribute table, function table, resource attributes, scope info, profile metadata, and every sample with its stack trace rendered as a tree with frame-type colors.
+
+| Key | Action |
+|-----|--------|
+| `h` / `←`  `l` / `→` | Previous / next request |
+| `j` / `↓`  `k` / `↑` | Scroll up / down |
+| `d` / `u` | Page down / up |
+| `g` / `G` | Jump to first / last request |
+| `/` | Search within current request |
+| `n` / `N` | Next / previous match |
+| `q` | Quit |
+
 ## Building
 
 Requires Rust 2024 edition and protobuf definitions from the `opentelemetry-proto` submodule.
