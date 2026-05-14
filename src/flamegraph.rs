@@ -77,18 +77,27 @@ impl FlameNode {
         }
     }
 
+    /// Walk down child names, stopping if a name is missing.
+    pub fn follow_path(&self, names: &[String]) -> &FlameNode {
+        names
+            .iter()
+            .fold(self, |node, name| node.child_by_name(name).unwrap_or(node))
+    }
+
+    /// Walk down child indices, stopping if an index is out of bounds.
+    pub fn follow_indices(&self, indices: &[usize]) -> &FlameNode {
+        indices
+            .iter()
+            .fold(self, |node, &idx| node.children.get(idx).unwrap_or(node))
+    }
+
     #[allow(dead_code)]
     pub fn max_depth(&self) -> usize {
-        if self.children.is_empty() {
-            0
-        } else {
-            1 + self
-                .children
-                .iter()
-                .map(|c| c.max_depth())
-                .max()
-                .unwrap_or(0)
-        }
+        self.children
+            .iter()
+            .map(|c| c.max_depth())
+            .max()
+            .map_or(0, |d| d + 1)
     }
 }
 
@@ -109,26 +118,6 @@ impl FlameGraph {
     }
 }
 
-pub fn get_zoom_node<'a>(root: &'a FlameNode, zoom_path: &[String]) -> &'a FlameNode {
-    let mut node = root;
-    for name in zoom_path {
-        if let Some(child) = node.child_by_name(name) {
-            node = child;
-        }
-    }
-    node
-}
-
-pub fn get_node<'a>(root: &'a FlameNode, index_path: &[usize]) -> &'a FlameNode {
-    let mut node = root;
-    for &idx in index_path {
-        if idx < node.children.len() {
-            node = &node.children[idx];
-        }
-    }
-    node
-}
-
 pub struct FrameRect {
     pub x: u16,
     pub width: u16,
@@ -137,10 +126,6 @@ pub struct FrameRect {
     pub self_value: i64,
     pub total_value: i64,
     pub palette_index: usize,
-}
-
-pub fn thread_rank(root: &FlameNode, thread_name: &str) -> usize {
-    root.child_position(thread_name).unwrap_or(0)
 }
 
 pub fn layout_frames(
@@ -187,11 +172,11 @@ fn layout_recursive(
 
     let mut child_x = x_float;
     for (i, child) in node.children.iter().enumerate() {
-        let child_palette = if depth == 0 && palette.is_none() {
-            Some(i)
+        let child_palette = Some(if depth == 0 && palette.is_none() {
+            i
         } else {
-            Some(palette_index)
-        };
+            palette_index
+        });
         layout_recursive(child, child_x, depth + 1, scale, child_palette, frames);
         child_x += child.total_value as f64 * scale;
     }

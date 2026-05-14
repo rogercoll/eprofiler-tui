@@ -8,8 +8,8 @@ use ratatui::{
 };
 
 use super::flamescope_layout::FlamescopeLayout;
-use super::state::{ActiveTab, ExecutablesTab, FlamegraphTab, FlamescopeTab, State};
-use crate::flamegraph::{cursor_frame_rect, get_zoom_node, layout_frames, thread_rank};
+use super::state::{ActiveTab, ExecutablesTab, FlamegraphTab, FlamescopeTab, SearchOverlay, State};
+use crate::flamegraph::{cursor_frame_rect, layout_frames};
 
 const BG: Color = Color::Rgb(16, 16, 22);
 const ACCENT: Color = Color::Rgb(59, 130, 246);
@@ -49,33 +49,8 @@ pub fn render(state: &mut State, frame: &mut Frame) {
                 frame,
                 chunks[3],
             );
-
             if state.fg.search.active {
-                let items: Vec<&str> = state
-                    .fg
-                    .search
-                    .matches
-                    .iter()
-                    .map(|(name, _)| name.as_str())
-                    .collect();
-                render_overlay(
-                    frame,
-                    chunks[2],
-                    &OverlayProps {
-                        title: " thread.name ",
-                        input: &state.fg.search.input,
-                        items: &items,
-                        cursor: state.fg.search.cursor,
-                        border_color: Color::Rgb(245, 166, 35),
-                        max_visible: 3,
-                        empty_hint: if state.fg.search.input.is_empty() {
-                            "type to filter threads..."
-                        } else {
-                            "no matches"
-                        },
-                        popup_width: 50,
-                    },
-                );
+                render_search_overlay(&state.fg.search, frame, chunks[2]);
             }
         }
         ActiveTab::Flamescope => {
@@ -88,27 +63,8 @@ pub fn render(state: &mut State, frame: &mut Frame) {
                 frame,
                 chunks[3],
             );
-
             if state.fs.search.active {
-                let items: Vec<&str> = state.fs.search.matches.iter().map(String::as_str).collect();
-                render_overlay(
-                    frame,
-                    chunks[2],
-                    &OverlayProps {
-                        title: " thread.name ",
-                        input: &state.fs.search.input,
-                        items: &items,
-                        cursor: state.fs.search.cursor,
-                        border_color: Color::Rgb(245, 166, 35),
-                        max_visible: 3,
-                        empty_hint: if state.fs.search.input.is_empty() {
-                            "type to filter threads..."
-                        } else {
-                            "no matches"
-                        },
-                        popup_width: 50,
-                    },
-                );
+                render_search_overlay(&state.fs.search, frame, chunks[2]);
             }
         }
         ActiveTab::Executables => {
@@ -121,7 +77,6 @@ pub fn render(state: &mut State, frame: &mut Frame) {
                 frame,
                 chunks[3],
             );
-
             if state.exe.path_input.active {
                 let pi = &state.exe.path_input;
                 let items: Vec<&str> = pi.completions.iter().map(String::as_str).collect();
@@ -326,6 +281,28 @@ fn render_header(state: &State, frame: &mut Frame, area: Rect) {
     }
 }
 
+fn render_search_overlay(search: &SearchOverlay, frame: &mut Frame, area: Rect) {
+    let items: Vec<&str> = search.matches.iter().map(String::as_str).collect();
+    render_overlay(
+        frame,
+        area,
+        &OverlayProps {
+            title: " thread.name ",
+            input: &search.input,
+            items: &items,
+            cursor: search.cursor,
+            border_color: Color::Rgb(245, 166, 35),
+            max_visible: 3,
+            empty_hint: if search.input.is_empty() {
+                "type to filter threads..."
+            } else {
+                "no matches"
+            },
+            popup_width: 50,
+        },
+    );
+}
+
 fn render_detail_bar(fg: &FlamegraphTab, frame: &mut Frame, area: Rect) {
     let sel = &fg.selection;
     if sel.name.is_empty() && fg.zoom_path.is_empty() {
@@ -333,7 +310,7 @@ fn render_detail_bar(fg: &FlamegraphTab, frame: &mut Frame, area: Rect) {
     }
 
     let sep = " │ ".fg(Color::Rgb(55, 55, 65));
-    let root_total = get_zoom_node(&fg.graph.root, &fg.zoom_path).total_value;
+    let root_total = fg.graph.root.follow_path(&fg.zoom_path).total_value;
 
     let mut spans: Vec<Span> = Vec::new();
 
@@ -400,7 +377,7 @@ fn render_flamegraph(fg: &mut FlamegraphTab, frame: &mut Frame, area: Rect) {
         return;
     }
 
-    let zoom_root = get_zoom_node(&fg.graph.root, &fg.zoom_path);
+    let zoom_root = fg.graph.root.follow_path(&fg.zoom_path);
     if zoom_root.total_value <= 0 {
         render_empty_fg(buf, area);
         return;
@@ -409,7 +386,7 @@ fn render_flamegraph(fg: &mut FlamegraphTab, frame: &mut Frame, area: Rect) {
     let forced_palette = fg
         .zoom_path
         .first()
-        .map(|name| thread_rank(&fg.graph.root, name));
+        .and_then(|name| fg.graph.root.child_position(name));
 
     let frames = layout_frames(zoom_root, area.width, forced_palette);
     let max_depth = frames.iter().map(|f| f.depth).max().unwrap_or(0);

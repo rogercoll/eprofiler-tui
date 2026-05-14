@@ -2,30 +2,11 @@ use std::collections::HashMap;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
+use super::{SearchAction, SearchOverlay};
+
 const SUBSECOND_ROWS: usize = 10;
 const NS_PER_SEC: u64 = 1_000_000_000;
 const NS_PER_ROW: u64 = NS_PER_SEC / SUBSECOND_ROWS as u64;
-
-#[derive(Default)]
-pub struct ThreadSearch {
-    pub active: bool,
-    pub input: String,
-    pub matches: Vec<String>,
-    pub cursor: usize,
-}
-
-impl ThreadSearch {
-    fn open(&mut self) {
-        *self = Self {
-            active: true,
-            ..Default::default()
-        };
-    }
-
-    fn close(&mut self) {
-        *self = Self::default();
-    }
-}
 
 pub struct FlamescopeTab {
     epoch_ns: Option<u64>,
@@ -33,7 +14,7 @@ pub struct FlamescopeTab {
     threads: HashMap<String, Vec<[u64; SUBSECOND_ROWS]>>,
     thread_names: Vec<String>,
     pub filter: Option<String>,
-    pub search: ThreadSearch,
+    pub search: SearchOverlay,
     pub auto_scroll: bool,
     pub scroll_x: usize,
     pub cursor_col: usize,
@@ -48,7 +29,7 @@ impl Default for FlamescopeTab {
             threads: HashMap::new(),
             thread_names: Vec::new(),
             filter: None,
-            search: ThreadSearch::default(),
+            search: SearchOverlay::default(),
             auto_scroll: true,
             scroll_x: 0,
             cursor_col: 0,
@@ -74,8 +55,8 @@ impl FlamescopeTab {
                 let epoch = *self.epoch_ns.get_or_insert(ts);
                 let offset = ts.saturating_sub(epoch);
                 let col = (offset / NS_PER_SEC) as usize;
-                let row = ((offset % NS_PER_SEC) / NS_PER_ROW) as usize;
-                let row = row.min(SUBSECOND_ROWS - 1);
+                let row =
+                    ((offset % NS_PER_SEC) / NS_PER_ROW).min(SUBSECOND_ROWS as u64 - 1) as usize;
 
                 while self.columns.len() <= col {
                     self.columns.push([0; SUBSECOND_ROWS]);
@@ -168,33 +149,14 @@ impl FlamescopeTab {
     }
 
     fn handle_search_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc => self.search.close(),
-            KeyCode::Enter => {
-                if let Some(name) = self.search.matches.get(self.search.cursor).cloned() {
-                    self.filter = Some(name);
-                    self.cursor_col = 0;
-                    self.scroll_x = 0;
-                    self.auto_scroll = true;
-                }
-                self.search.close();
+        match self.search.handle_key(key) {
+            SearchAction::Selected(Some(name)) => {
+                self.filter = Some(name);
+                self.cursor_col = 0;
+                self.scroll_x = 0;
+                self.auto_scroll = true;
             }
-            KeyCode::Backspace => {
-                self.search.input.pop();
-                self.search.cursor = 0;
-                self.refresh_search();
-            }
-            KeyCode::Up => self.search.cursor = self.search.cursor.saturating_sub(1),
-            KeyCode::Down => {
-                if self.search.cursor + 1 < self.search.matches.len() {
-                    self.search.cursor += 1;
-                }
-            }
-            KeyCode::Char(c) => {
-                self.search.input.push(c);
-                self.search.cursor = 0;
-                self.refresh_search();
-            }
+            SearchAction::Refresh => self.refresh_search(),
             _ => {}
         }
     }

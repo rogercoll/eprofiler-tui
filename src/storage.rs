@@ -124,12 +124,14 @@ pub struct SymbolStore {
 
 impl SymbolStore {
     pub fn open(path: impl AsRef<Path>) -> crate::Result<Self> {
-        let db = Database::builder(path.as_ref()).open().map_err(|e| match e {
-            fjall::Error::InvalidVersion(_) => {
-                crate::error::Error::StorageVersionMismatch(path.as_ref().to_path_buf())
-            }
-            other => other.into(),
-        })?;
+        let db = Database::builder(path.as_ref())
+            .open()
+            .map_err(|e| match e {
+                fjall::Error::InvalidVersion(_) => {
+                    crate::error::Error::StorageVersionMismatch(path.as_ref().to_path_buf())
+                }
+                other => other.into(),
+            })?;
         let ranges = db.keyspace("ranges", KeyspaceCreateOptions::default)?;
         let strings = db.keyspace("strings", KeyspaceCreateOptions::default)?;
         let files = db.keyspace("files", KeyspaceCreateOptions::default)?;
