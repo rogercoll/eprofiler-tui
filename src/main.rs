@@ -18,9 +18,7 @@ use error::Result;
 use storage::SymbolStore;
 use tui::Tui;
 use tui::event::{Event, EventHandler};
-use tui::state::State;
-
-use crate::tui::state::Action;
+use tui::state::{Action, State};
 
 #[derive(Parser)]
 #[command(
@@ -56,38 +54,15 @@ fn main() -> Result<()> {
     }
 
     let listen_addr = format!("0.0.0.0:{}", cli.port);
-
-    let storage_path: PathBuf = match cli.data_dir {
-        Some(custom_path) => custom_path,
-        None => {
-            // ProjectDirs::from takes (qualifier, organization, application_name)
-            let proj_dirs = ProjectDirs::from("", "", "eprofiler-tui")
-                .expect("Could not determine the user's home directory!");
-            proj_dirs.data_local_dir().to_path_buf()
-        }
-    };
-
-    if !storage_path.exists() {
-        std::fs::create_dir_all(&storage_path)
-            .expect("Failed to create the storage directory. Check permissions.");
-    }
-
-    let store = Arc::new(SymbolStore::open(storage_path)?);
+    let storage_path = resolve_storage_path(cli.data_dir)?;
+    let store = Arc::new(SymbolStore::open(&storage_path)?);
     let events = EventHandler::new(100);
 
-    std::thread::spawn({
-        let store = Arc::clone(&store);
-        let listen_addr = listen_addr.clone();
-        let events = events.sender.clone();
-        move || {
-            let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-            rt.block_on(async {
-                if let Err(e) = grpc::start_server(events, &listen_addr, store).await {
-                    eprintln!("gRPC server error: {e}");
-                }
-            });
-        }
-    });
+    spawn_grpc_server(
+        Arc::clone(&store),
+        listen_addr.clone(),
+        events.sender.clone(),
+    );
 
     let backend = CrosstermBackend::new(std::io::stderr());
     let terminal = Terminal::new(backend)?;
@@ -99,88 +74,94 @@ fn main() -> Result<()> {
     while state.running {
         tui.draw(&mut state)?;
 
-        match tui.events.next()? {
-            Event::Tick => {}
-            Event::Key(key_event) => match state.handle_key(key_event) {
-                Action::None => {}
-                Action::LoadSymbols(path, target_name) => {
-                    std::thread::spawn({
-                        let store = Arc::clone(&store);
-                        let sender = tui.events.sender.clone();
-                        move || {
-                            let file_name = path
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| path.display().to_string());
-
-                            let _ = sender.send(Event::SymbolsLoaded {
-                                target_name: target_name.unwrap_or(file_name.clone()),
-                                info: symbolizer::extract_symbols(&path).and_then(|file_sym| {
-                                    let info = storage::ExecutableInfo {
-                                        file_id: file_sym.file_id,
-                                        file_name,
-                                        num_ranges: file_sym.ranges.len() as u32,
-                                    };
-                                    store.store_file_symbols(&file_sym, &path)?;
-                                    Ok(info)
-                                }),
-                            });
-                        }
-                    });
-                }
-                Action::RemoveSymbols(name, file_id) => {
-                    state.exe.status = Some(format!("Removing {}", name));
-                    std::thread::spawn({
-                        let sender = tui.events.sender.clone();
-                        let store = Arc::clone(&store);
-                        move || {
-                            Box::new(sender.send(Event::SymbolsRemoved {
-                                name,
-                                error: store.remove_file_symbols(file_id).err(),
-                            }))
-                        }
-                    });
-                }
-            },
-            Event::Resize => {}
-            Event::ProfileUpdate {
-                flamegraph,
-                samples,
-                timestamps,
-            } => {
-                if !state.fg.frozen {
-                    state.fs.record_timestamps(&timestamps);
-                }
-                state.fg.merge(flamegraph, samples);
-            }
-            Event::MappingsDiscovered(names) => {
-                state.exe.merge_discovered_mappings(names);
-            }
-            Event::SymbolsLoaded { target_name, info } => {
-                match info {
-                    Ok(info) => {
-                        state.exe.status = Some(format!(
-                            "Loaded {} symbols for {}",
-                            info.num_ranges, target_name
-                        ));
-                        state.exe.update_symbolized(target_name, info);
-                    }
-                    Err(err) => {
-                        state.exe.status = Some(format!("Error loading {}: {}", target_name, err))
-                    }
-                };
-            }
-            Event::SymbolsRemoved { name, error } => {
-                state.exe.status = Some(
-                    error
-                        .map(|err| format!("Error removing {}: {}", name, err))
-                        .unwrap_or(format!("Removed symbols for {}", name)),
+        match state.handle_event(tui.events.next()?) {
+            Action::None => {}
+            Action::LoadSymbols(path, target_name) => {
+                spawn_symbol_load(
+                    Arc::clone(&store),
+                    tui.events.sender.clone(),
+                    path,
+                    target_name,
                 );
-                state.exe.clear_symbols(&name);
+            }
+            Action::RemoveSymbols(name, file_id) => {
+                state.exe.status = Some(format!("Removing {name}"));
+                spawn_symbol_remove(Arc::clone(&store), tui.events.sender.clone(), name, file_id);
             }
         }
     }
 
     tui.exit()?;
     Ok(())
+}
+
+fn resolve_storage_path(data_dir: Option<PathBuf>) -> Result<PathBuf> {
+    let path = match data_dir {
+        Some(p) => p,
+        None => ProjectDirs::from("", "", "eprofiler-tui")
+            .expect("Could not determine the user's home directory!")
+            .data_local_dir()
+            .to_path_buf(),
+    };
+    if !path.exists() {
+        std::fs::create_dir_all(&path)
+            .expect("Failed to create the storage directory. Check permissions.");
+    }
+    Ok(path)
+}
+
+fn spawn_grpc_server(
+    store: Arc<SymbolStore>,
+    listen_addr: String,
+    event_tx: std::sync::mpsc::Sender<Event>,
+) {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        rt.block_on(async {
+            if let Err(e) = grpc::start_server(event_tx, &listen_addr, store).await {
+                eprintln!("gRPC server error: {e}");
+            }
+        });
+    });
+}
+
+fn spawn_symbol_load(
+    store: Arc<SymbolStore>,
+    sender: std::sync::mpsc::Sender<Event>,
+    path: PathBuf,
+    target_name: Option<String>,
+) {
+    std::thread::spawn(move || {
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+
+        let _ = sender.send(Event::SymbolsLoaded {
+            target_name: target_name.unwrap_or_else(|| file_name.clone()),
+            info: symbolizer::extract_symbols(&path).and_then(|file_sym| {
+                let info = storage::ExecutableInfo {
+                    file_id: file_sym.file_id,
+                    file_name,
+                    num_ranges: file_sym.ranges.len() as u32,
+                };
+                store.store_file_symbols(&file_sym, &path)?;
+                Ok(info)
+            }),
+        });
+    });
+}
+
+fn spawn_symbol_remove(
+    store: Arc<SymbolStore>,
+    sender: std::sync::mpsc::Sender<Event>,
+    name: String,
+    file_id: storage::FileId,
+) {
+    std::thread::spawn(move || {
+        let _ = sender.send(Event::SymbolsRemoved {
+            name,
+            error: store.remove_file_symbols(file_id).err(),
+        });
+    });
 }

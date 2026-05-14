@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::storage::{ExecutableInfo, FileId};
+use crate::tui::event::Event;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ActiveTab {
@@ -23,6 +24,63 @@ pub enum Action {
     LoadSymbols(PathBuf, Option<String>),
     RemoveSymbols(String, FileId),
     None,
+}
+
+/// Shared search overlay used by multiple tabs.
+#[derive(Default)]
+pub struct SearchOverlay {
+    pub active: bool,
+    pub input: String,
+    pub matches: Vec<String>,
+    pub cursor: usize,
+}
+
+pub enum SearchAction {
+    None,
+    Closed,
+    Selected(Option<String>),
+    Refresh,
+}
+
+impl SearchOverlay {
+    pub fn open(&mut self) { *self = Self { active: true, ..Default::default() }; }
+
+    pub fn close(&mut self) { *self = Self::default(); }
+
+    pub fn handle_key(&mut self, key: KeyEvent) -> SearchAction {
+        match key.code {
+            KeyCode::Esc => {
+                self.close();
+                SearchAction::Closed
+            }
+            KeyCode::Enter => {
+                let selected = self.matches.get(self.cursor).cloned();
+                self.close();
+                SearchAction::Selected(selected)
+            }
+            KeyCode::Backspace => {
+                self.input.pop();
+                self.cursor = 0;
+                SearchAction::Refresh
+            }
+            KeyCode::Up => {
+                self.cursor = self.cursor.saturating_sub(1);
+                SearchAction::None
+            }
+            KeyCode::Down => {
+                if self.cursor + 1 < self.matches.len() {
+                    self.cursor += 1;
+                }
+                SearchAction::None
+            }
+            KeyCode::Char(c) => {
+                self.input.push(c);
+                self.cursor = 0;
+                SearchAction::Refresh
+            }
+            _ => SearchAction::None,
+        }
+    }
 }
 
 pub struct State {
@@ -46,7 +104,38 @@ impl State {
         }
     }
 
-    pub fn handle_key(&mut self, key: KeyEvent) -> Action {
+    /// Central event handler: mutates state and returns an Action for side effects.
+    pub fn handle_event(&mut self, event: Event) -> Action {
+        match event {
+            Event::Tick | Event::Resize => Action::None,
+            Event::Key(key) => self.handle_key(key),
+            Event::ProfileUpdate {
+                flamegraph,
+                samples,
+                timestamps,
+            } => {
+                if !self.fg.frozen {
+                    self.fs.record_timestamps(&timestamps);
+                }
+                self.fg.merge(flamegraph, samples);
+                Action::None
+            }
+            Event::MappingsDiscovered(names) => {
+                self.exe.merge_discovered_mappings(names);
+                Action::None
+            }
+            Event::SymbolsLoaded { target_name, info } => {
+                self.exe.handle_symbols_loaded(target_name, info);
+                Action::None
+            }
+            Event::SymbolsRemoved { name, error } => {
+                self.exe.handle_symbols_removed(name, error);
+                Action::None
+            }
+        }
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> Action {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.running = false;
             return Action::None;
@@ -70,14 +159,8 @@ impl State {
         }
 
         match self.active_tab {
-            ActiveTab::Flamegraph => {
-                self.fg.handle_key(key);
-                Action::None
-            }
-            ActiveTab::Flamescope => {
-                self.fs.handle_key(key);
-                Action::None
-            }
+            ActiveTab::Flamegraph => { self.fg.handle_key(key); Action::None }
+            ActiveTab::Flamescope => { self.fs.handle_key(key); Action::None }
             ActiveTab::Executables => self.exe.handle_key(key),
         }
     }

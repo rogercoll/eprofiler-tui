@@ -1,6 +1,7 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
-use crate::flamegraph::{FlameGraph, FlameNode, get_node, get_zoom_node};
+use super::{SearchAction, SearchOverlay};
+use crate::flamegraph::{FlameGraph, FlameNode};
 
 #[derive(Default)]
 pub struct Selection {
@@ -9,27 +10,6 @@ pub struct Selection {
     pub total_value: i64,
     pub pct: f64,
     pub depth: usize,
-}
-
-#[derive(Default)]
-pub struct SearchOverlay {
-    pub active: bool,
-    pub input: String,
-    pub matches: Vec<(String, usize)>,
-    pub cursor: usize,
-}
-
-impl SearchOverlay {
-    pub fn open(&mut self) {
-        *self = Self {
-            active: true,
-            ..Default::default()
-        };
-    }
-
-    pub fn close(&mut self) {
-        *self = Self::default();
-    }
 }
 
 pub struct FlamegraphTab {
@@ -71,6 +51,8 @@ impl FlamegraphTab {
         self.samples_received += samples;
     }
 
+    fn zoom_root(&self) -> &FlameNode { self.graph.root.follow_path(&self.zoom_path) }
+
     pub(crate) fn handle_key(&mut self, key: KeyEvent) {
         if self.search.active {
             return self.handle_search_key(key);
@@ -93,32 +75,13 @@ impl FlamegraphTab {
     }
 
     fn handle_search_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc => self.search.close(),
-            KeyCode::Enter => {
-                if let Some((name, _)) = self.search.matches.get(self.search.cursor).cloned() {
-                    self.zoom_path = vec![name];
-                    self.cursor_path.clear();
-                    self.scroll_y = 0;
-                }
-                self.search.close();
+        match self.search.handle_key(key) {
+            SearchAction::Selected(Some(name)) => {
+                self.zoom_path = vec![name];
+                self.cursor_path.clear();
+                self.scroll_y = 0;
             }
-            KeyCode::Backspace => {
-                self.search.input.pop();
-                self.search.cursor = 0;
-                self.refresh_search();
-            }
-            KeyCode::Up => self.search.cursor = self.search.cursor.saturating_sub(1),
-            KeyCode::Down => {
-                if self.search.cursor + 1 < self.search.matches.len() {
-                    self.search.cursor += 1;
-                }
-            }
-            KeyCode::Char(c) => {
-                self.search.input.push(c);
-                self.search.cursor = 0;
-                self.refresh_search();
-            }
+            SearchAction::Refresh => self.refresh_search(),
             _ => {}
         }
     }
@@ -130,18 +93,18 @@ impl FlamegraphTab {
             .root
             .children
             .iter()
-            .enumerate()
-            .filter(|(_, c)| query.is_empty() || c.name.to_lowercase().contains(&query))
-            .map(|(i, c)| (c.name.clone(), i))
+            .filter(|c| query.is_empty() || c.name.to_lowercase().contains(&query))
+            .map(|c| c.name.clone())
             .collect();
     }
 
     fn move_down(&mut self) {
-        let has_children = {
-            let zr = get_zoom_node(&self.graph.root, &self.zoom_path);
-            !get_node(zr, &self.cursor_path).children.is_empty()
-        };
-        if has_children {
+        if !self
+            .zoom_root()
+            .follow_indices(&self.cursor_path)
+            .children
+            .is_empty()
+        {
             self.cursor_path.push(0);
         }
     }
@@ -157,15 +120,14 @@ impl FlamegraphTab {
     }
 
     fn move_right(&mut self) {
-        let sibling_count = {
-            if self.cursor_path.is_empty() {
-                return;
-            }
-            let zr = get_zoom_node(&self.graph.root, &self.zoom_path);
-            get_node(zr, &self.cursor_path[..self.cursor_path.len() - 1])
-                .children
-                .len()
-        };
+        if self.cursor_path.is_empty() {
+            return;
+        }
+        let sibling_count = self
+            .zoom_root()
+            .follow_indices(&self.cursor_path[..self.cursor_path.len() - 1])
+            .children
+            .len();
         if let Some(last) = self.cursor_path.last_mut()
             && *last + 1 < sibling_count
         {
@@ -177,10 +139,7 @@ impl FlamegraphTab {
         if self.cursor_path.is_empty() {
             return;
         }
-        let names = {
-            let zr = get_zoom_node(&self.graph.root, &self.zoom_path);
-            collect_path_names(zr, &self.cursor_path)
-        };
+        let names = collect_path_names(self.zoom_root(), &self.cursor_path);
         self.zoom_path.extend(names);
         self.cursor_path.clear();
         self.scroll_y = 0;

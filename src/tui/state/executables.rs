@@ -22,17 +22,9 @@ pub struct PathInput {
 }
 
 impl PathInput {
-    pub fn open(&mut self, target: Option<String>) {
-        *self = Self {
-            active: true,
-            target,
-            ..Default::default()
-        };
-    }
+    pub fn open(&mut self, target: Option<String>) { *self = Self { active: true, target, ..Default::default() }; }
 
-    pub fn close(&mut self) {
-        *self = Self::default();
-    }
+    pub fn close(&mut self) { *self = Self::default(); }
 
     fn refresh_completions(&mut self) {
         self.completions = compute_path_completions(&self.input);
@@ -110,6 +102,34 @@ impl ExecutablesTab {
         self.sort_list();
     }
 
+    pub fn handle_symbols_loaded(
+        &mut self,
+        target_name: String,
+        info: crate::error::Result<ExecutableInfo>,
+    ) {
+        match info {
+            Ok(info) => {
+                self.status = Some(format!(
+                    "Loaded {} symbols for {}",
+                    info.num_ranges, target_name
+                ));
+                self.update_symbolized(target_name, info);
+            }
+            Err(err) => {
+                self.status = Some(format!("Error loading {target_name}: {err}"));
+            }
+        }
+    }
+
+    pub fn handle_symbols_removed(&mut self, name: String, error: Option<crate::error::Error>) {
+        self.status = Some(
+            error
+                .map(|err| format!("Error removing {name}: {err}"))
+                .unwrap_or_else(|| format!("Removed symbols for {name}")),
+        );
+        self.clear_symbols(&name);
+    }
+
     fn sort_list(&mut self) {
         let current_name = self.list.get(self.cursor).map(|e| e.name.clone());
         self.list.sort_by(|a, b| {
@@ -128,12 +148,8 @@ impl ExecutablesTab {
     }
 
     fn clamp_cursor(&mut self) {
-        if self.list.is_empty() {
-            self.cursor = 0;
-            self.scroll = 0;
-        } else {
-            self.cursor = self.cursor.min(self.list.len() - 1);
-        }
+        self.cursor = if self.list.is_empty() { 0 } else { self.cursor.min(self.list.len() - 1) };
+        if self.list.is_empty() { self.scroll = 0; }
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Action {

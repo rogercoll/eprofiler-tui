@@ -25,64 +25,137 @@ impl ProfilesServer {
     }
 }
 
-fn unknown_basenames(
-    known: &RwLock<HashSet<String>>,
-    dict: &profiles::ProfilesDictionary,
-) -> Vec<String> {
-    dict.mapping_table
-        .iter()
-        .skip(1)
-        .fold(Vec::new(), |mut names, mapping| {
-            let name_idx = mapping.filename_strindex as usize;
-            if name_idx != 0 && name_idx < dict.string_table.len() {
-                let full_path = &dict.string_table[name_idx];
-                if !full_path.is_empty() && !known.read().unwrap().contains(full_path) {
-                    let basename = full_path.rsplit('/').next().unwrap_or(full_path);
-                    if !basename.is_empty() && !basename.starts_with('[') {
-                        known.write().unwrap().insert(full_path.to_string());
-                        names.push(basename.to_string());
-                    }
-                }
+/// Thin wrapper around `ProfilesDictionary` for ergonomic lookups.
+struct Dict<'a> {
+    d: &'a profiles::ProfilesDictionary,
+}
+
+impl<'a> Dict<'a> {
+    fn new(d: &'a profiles::ProfilesDictionary) -> Self {
+        Self { d }
+    }
+
+    fn str(&self, idx: i32) -> Option<&'a str> {
+        self.d
+            .string_table
+            .get(idx as usize)
+            .filter(|s| !s.is_empty())
+            .map(String::as_str)
+    }
+
+    fn func_name(&self, line: &profiles::Line) -> &'a str {
+        self.d
+            .function_table
+            .get(line.function_index as usize)
+            .filter(|_| line.function_index > 0)
+            .and_then(|f| self.str(f.name_strindex))
+            .unwrap_or("[unknown]")
+    }
+
+    fn mapping_basename(&self, location: &profiles::Location) -> &'a str {
+        self.d
+            .mapping_table
+            .get(location.mapping_index as usize)
+            .filter(|_| location.mapping_index > 0)
+            .and_then(|m| self.str(m.filename_strindex))
+            .map(|full| full.rsplit('/').next().unwrap_or(full))
+            .unwrap_or("[unknown]")
+    }
+
+    fn frame_type(&self, location: &profiles::Location) -> &str {
+        self.find_attr_value(&location.attribute_indices, "profile.frame.type")
+            .map(|s| match s {
+                "native" => "Native",
+                "kernel" => "Kernel",
+                "jvm" => "JVM",
+                "cpython" => "Python",
+                "php" | "phpjit" => "PHP",
+                "ruby" => "Ruby",
+                "perl" => "Perl",
+                "v8js" => "JS",
+                "dotnet" => ".NET",
+                "beam" => "Beam",
+                "go" => "Go",
+                other => other,
+            })
+            .unwrap_or("Unknown")
+    }
+
+    fn thread_name(&self, sample: &profiles::Sample) -> &'a str {
+        self.find_attr_value(&sample.attribute_indices, "thread.name")
+            .unwrap_or("[unknown]")
+    }
+
+    fn find_attr_value(&self, indices: &[i32], key: &str) -> Option<&'a str> {
+        indices.iter().find_map(|&idx| {
+            let attr = self
+                .d
+                .attribute_table
+                .get(idx as usize)
+                .filter(|_| idx > 0)?;
+            let k = self.str(attr.key_strindex)?;
+            if k != key {
+                return None;
             }
-            names
+            match attr.value.as_ref()?.value.as_ref()? {
+                common::any_value::Value::StringValue(s) if !s.is_empty() => Some(s.as_str()),
+                _ => None,
+            }
         })
+    }
+
+    fn unknown_basenames(&self, known: &RwLock<HashSet<String>>) -> Vec<String> {
+        self.d
+            .mapping_table
+            .iter()
+            .skip(1)
+            .filter_map(|mapping| {
+                let full_path = self.str(mapping.filename_strindex)?;
+                if known.read().ok()?.contains(full_path) {
+                    return None;
+                }
+                let basename = full_path.rsplit('/').next().unwrap_or(full_path);
+                if basename.is_empty() || basename.starts_with('[') {
+                    return None;
+                }
+                known.write().ok()?.insert(full_path.to_string());
+                Some(basename.to_string())
+            })
+            .collect()
+    }
 }
 
 /// Pre-resolves the location table into human-readable strings.
-/// This turns a complex Protobuf traversal into a simple O(1) vector lookup.
-fn pre_resolve_locations(dict: &profiles::ProfilesDictionary, store: &SymbolStore) -> Vec<String> {
-    dict.location_table
+fn pre_resolve_locations(dict: &Dict, store: &SymbolStore) -> Vec<String> {
+    dict.d
+        .location_table
         .iter()
         .map(|location| {
-            let frame_tag = resolve_frame_type(location, dict);
+            let tag = dict.frame_type(location);
             if location.lines.is_empty() {
-                // Try native symbolication
-                if frame_tag == "Native"
+                if tag == "Native"
                     && let Some(names) = symbolize_native(store, location, dict)
                 {
-                    // Join inlined native frames into one string for the cache
                     return names
                         .iter()
                         .enumerate()
                         .map(|(i, n)| {
-                            format!("{} [Native]{}", n, if i > 0 { " [Inline]" } else { "" })
+                            format!("{n} [Native]{}", if i > 0 { " [Inline]" } else { "" })
                         })
                         .collect::<Vec<_>>()
                         .join(" / ");
                 }
-                format_with_tag(&resolve_unsymbolized_label(location, dict), &frame_tag)
+                let basename = dict.mapping_basename(location);
+                format!("{basename}+0x{:016x} [{tag}]", location.address)
             } else {
-                // Resolve known lines
                 location
                     .lines
                     .iter()
                     .enumerate()
                     .map(|(i, line)| {
-                        let func_name = resolve_function_name(line, dict);
                         format!(
-                            "{} [{}]{}",
-                            func_name,
-                            frame_tag,
+                            "{} [{tag}]{}",
+                            dict.func_name(line),
                             if i > 0 { " [Inline]" } else { "" }
                         )
                     })
@@ -99,66 +172,66 @@ fn process_export(
     known: &RwLock<HashSet<String>>,
     event_tx: &mpsc::Sender<Event>,
 ) {
-    let mut flamegraph = FlameGraph::new();
-    let Some(dict) = req.dictionary.as_ref() else {
-        // return, no string data can be referenced
+    let Some(raw_dict) = req.dictionary.as_ref() else {
         return;
     };
+    let dict = Dict::new(raw_dict);
 
+    let mut flamegraph = FlameGraph::new();
     let mut stack_cache: HashMap<i32, Vec<String>> = HashMap::new();
-    let location_cache = pre_resolve_locations(dict, store);
-
+    let location_cache = pre_resolve_locations(&dict, store);
     let mut sample_count: u64 = 0;
     let mut thread_timestamps: HashMap<String, Vec<u64>> = HashMap::new();
 
-    for resource_profiles in &req.resource_profiles {
-        for scope_profiles in &resource_profiles.scope_profiles {
-            for profile in &scope_profiles.profiles {
-                for sample in &profile.samples {
-                    let stack = stack_cache.entry(sample.stack_index).or_insert_with(|| {
-                        let idx = sample.stack_index as usize;
-                        if idx == 0 || idx >= dict.stack_table.len() {
-                            return Vec::new();
-                        }
+    let samples = req
+        .resource_profiles
+        .iter()
+        .flat_map(|rp| &rp.scope_profiles)
+        .flat_map(|sp| &sp.profiles)
+        .flat_map(|p| &p.samples);
 
-                        let mut frames = Vec::new();
-                        for &loc_idx in &dict.stack_table[idx].location_indices {
-                            let loc_idx = loc_idx as usize;
-                            if loc_idx < location_cache.len() {
-                                frames.push(location_cache[loc_idx].clone());
-                            }
-                        }
-                        frames.reverse(); // Standard pprof leaf-to-root reversal
-
-                        let comm = resolve_thread_name(sample, dict);
-                        let mut result = Vec::with_capacity(frames.len() + 1);
-                        result.push(comm);
-                        result.extend(frames);
-                        result
-                    });
-
-                    if !stack.is_empty() {
-                        let value = if !sample.timestamps_unix_nano.is_empty() {
-                            thread_timestamps
-                                .entry(stack[0].clone())
-                                .or_default()
-                                .extend_from_slice(&sample.timestamps_unix_nano);
-                            sample.timestamps_unix_nano.len() as i64
-                        } else if !sample.values.is_empty() {
-                            sample.values.iter().sum::<i64>().max(1)
-                        } else {
-                            1
-                        };
-
-                        flamegraph.add_stack(stack, value);
-                        sample_count += value as u64;
-                    }
-                }
+    for sample in samples {
+        let stack = stack_cache.entry(sample.stack_index).or_insert_with(|| {
+            let idx = sample.stack_index as usize;
+            if idx == 0 || idx >= dict.d.stack_table.len() {
+                return Vec::new();
             }
+
+            let mut frames: Vec<String> = dict.d.stack_table[idx]
+                .location_indices
+                .iter()
+                .filter_map(|&loc_idx| location_cache.get(loc_idx as usize).cloned())
+                .collect();
+            frames.reverse();
+
+            let comm = dict.thread_name(sample).to_string();
+            let mut result = Vec::with_capacity(frames.len() + 1);
+            result.push(comm);
+            result.extend(frames);
+            result
+        });
+
+        if stack.is_empty() {
+            continue;
         }
+
+        let value = if !sample.timestamps_unix_nano.is_empty() {
+            thread_timestamps
+                .entry(stack[0].clone())
+                .or_default()
+                .extend_from_slice(&sample.timestamps_unix_nano);
+            sample.timestamps_unix_nano.len() as i64
+        } else if !sample.values.is_empty() {
+            sample.values.iter().sum::<i64>().max(1)
+        } else {
+            1
+        };
+
+        flamegraph.add_stack(stack, value);
+        sample_count += value as u64;
     }
 
-    let basenames = unknown_basenames(known, dict);
+    let basenames = dict.unknown_basenames(known);
     if !basenames.is_empty() {
         let _ = event_tx.send(Event::MappingsDiscovered(basenames));
     }
@@ -195,15 +268,14 @@ impl collector::profiles_service_server::ProfilesService for ProfilesServer {
     }
 }
 
-/// Try to symbolize a native frame via the local symbol store.
 fn symbolize_native(
     store: &SymbolStore,
     location: &profiles::Location,
-    dict: &profiles::ProfilesDictionary,
+    dict: &Dict,
 ) -> Option<Vec<String>> {
     let resolved = store
         .lookup(
-            store.file_id_for_basename(&resolve_mapping_filename(location, dict))?,
+            store.file_id_for_basename(dict.mapping_basename(location))?,
             location.address,
         )
         .ok()?;
@@ -211,120 +283,6 @@ fn symbolize_native(
         return None;
     }
     Some(resolved.into_iter().map(|f| f.func).collect())
-}
-
-fn resolve_function_name(line: &profiles::Line, dict: &profiles::ProfilesDictionary) -> String {
-    let func_idx = line.function_index as usize;
-    if func_idx == 0 || func_idx >= dict.function_table.len() {
-        return "[unknown]".to_string();
-    }
-    let func = &dict.function_table[func_idx];
-    let name_idx = func.name_strindex as usize;
-    if name_idx < dict.string_table.len() && !dict.string_table[name_idx].is_empty() {
-        dict.string_table[name_idx].clone()
-    } else {
-        "[unknown]".to_string()
-    }
-}
-
-fn resolve_unsymbolized_label(
-    location: &profiles::Location,
-    dict: &profiles::ProfilesDictionary,
-) -> String {
-    let mapping_name = resolve_mapping_filename(location, dict);
-    format!("{}+0x{:016x}", mapping_name, location.address)
-}
-
-fn resolve_mapping_filename(
-    location: &profiles::Location,
-    dict: &profiles::ProfilesDictionary,
-) -> String {
-    let mapping_idx = location.mapping_index as usize;
-    if mapping_idx == 0 || mapping_idx >= dict.mapping_table.len() {
-        return "[unknown]".to_string();
-    }
-    let mapping = &dict.mapping_table[mapping_idx];
-    let name_idx = mapping.filename_strindex as usize;
-    if name_idx < dict.string_table.len() && !dict.string_table[name_idx].is_empty() {
-        let full_path = &dict.string_table[name_idx];
-        full_path
-            .rsplit('/')
-            .next()
-            .unwrap_or(full_path)
-            .to_string()
-    } else {
-        "[unknown]".to_string()
-    }
-}
-
-fn resolve_frame_type(
-    location: &profiles::Location,
-    dict: &profiles::ProfilesDictionary,
-) -> String {
-    for &attr_idx in &location.attribute_indices {
-        let attr_idx = attr_idx as usize;
-        if attr_idx == 0 || attr_idx >= dict.attribute_table.len() {
-            continue;
-        }
-        let attr = &dict.attribute_table[attr_idx];
-        let key_idx = attr.key_strindex as usize;
-        if key_idx >= dict.string_table.len() {
-            continue;
-        }
-        if dict.string_table[key_idx] != "profile.frame.type" {
-            continue;
-        }
-        if let Some(ref value) = attr.value
-            && let Some(common::any_value::Value::StringValue(ref s)) = value.value
-        {
-            return match s.as_str() {
-                "native" => "Native".to_string(),
-                "kernel" => "Kernel".to_string(),
-                "jvm" => "JVM".to_string(),
-                "cpython" => "Python".to_string(),
-                "php" | "phpjit" => "PHP".to_string(),
-                "ruby" => "Ruby".to_string(),
-                "perl" => "Perl".to_string(),
-                "v8js" => "JS".to_string(),
-                "dotnet" => ".NET".to_string(),
-                "beam" => "Beam".to_string(),
-                "go" => "Go".to_string(),
-                other => other.to_string(),
-            };
-        }
-    }
-    String::from("Unknown")
-}
-
-fn format_with_tag(label: &str, tag: &str) -> String {
-    if tag.is_empty() {
-        label.to_string()
-    } else {
-        format!("{} [{}]", label, tag)
-    }
-}
-
-fn resolve_thread_name(sample: &profiles::Sample, dict: &profiles::ProfilesDictionary) -> String {
-    for &attr_idx in &sample.attribute_indices {
-        let attr_idx = attr_idx as usize;
-        if attr_idx == 0 || attr_idx >= dict.attribute_table.len() {
-            continue;
-        }
-        let attr = &dict.attribute_table[attr_idx];
-        let key_idx = attr.key_strindex as usize;
-        if key_idx >= dict.string_table.len() {
-            continue;
-        }
-        let key = &dict.string_table[key_idx];
-        if key == "thread.name"
-            && let Some(ref value) = attr.value
-            && let Some(common::any_value::Value::StringValue(ref s)) = value.value
-            && !s.is_empty()
-        {
-            return s.clone();
-        }
-    }
-    "[unknown]".to_string()
 }
 
 pub async fn start_server(
@@ -365,7 +323,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(crate::storage::SymbolStore::open(tmp.path()).unwrap());
         tokio::spawn(async move {
-            let _tmp = tmp; // keep tempdir alive for the server's lifetime
+            let _tmp = tmp;
             let server = ProfilesServer::new(tx, store);
             tonic::transport::Server::builder()
                 .add_service(collector::profiles_service_server::ProfilesServiceServer::new(server))
