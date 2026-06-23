@@ -16,7 +16,7 @@ exclude = ["opentelemetry-ebpf-profiler"]
 
 [dependencies]
 better-panic = "0.3"
-clap = { version = "4.6.0", features = ["derive"] }
+clap = { version = "4.6.1", features = ["derive"] }
 eprofiler-proto = { path = "proto" }
 ratatui = "0.30"
 thiserror = "2"
