@@ -63,7 +63,7 @@ impl FlameNode {
 
     pub fn sort_recursive(&mut self) {
         self.children
-            .sort_by(|a, b| b.total_value.cmp(&a.total_value));
+            .sort_by_key(|c| std::cmp::Reverse(c.total_value));
         self.rebuild_index();
         for child in &mut self.children {
             child.sort_recursive();
@@ -89,6 +89,13 @@ impl FlameNode {
         indices
             .iter()
             .fold(self, |node, &idx| node.children.get(idx).unwrap_or(node))
+    }
+
+    /// Walk down child indices; `None` if any index is out of bounds.
+    pub fn descend(&self, indices: &[usize]) -> Option<&FlameNode> {
+        indices
+            .iter()
+            .try_fold(self, |node, &idx| node.children.get(idx))
     }
 
     #[allow(dead_code)]

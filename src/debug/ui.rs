@@ -1,6 +1,5 @@
 use ratatui::{
     Frame,
-    buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
@@ -13,18 +12,24 @@ use eprofiler_proto::opentelemetry::proto::profiles::v1development as profiles;
 
 use super::DebugState;
 
-const BG: Color = Color::Rgb(16, 16, 22);
-const ACCENT: Color = Color::Rgb(59, 130, 246);
-const DIM: Color = Color::Rgb(70, 70, 85);
-const BRIGHT: Color = Color::Rgb(220, 220, 235);
-const SECTION: Color = Color::Rgb(96, 165, 250);
-const KEY: Color = Color::Rgb(253, 224, 71);
-const VAL: Color = Color::Rgb(190, 242, 100);
-const ADDR: Color = Color::Rgb(251, 191, 36);
-const PURPLE: Color = Color::Rgb(168, 85, 247);
-const ORANGE: Color = Color::Rgb(249, 115, 22);
-const WARN: Color = Color::Rgb(239, 68, 68);
-const SEARCH_BORDER: Color = Color::Rgb(245, 166, 35);
+use crate::tui::draw::{center, fill, key_hints, popup_frame, truncate};
+use crate::tui::theme::{
+    ACCENT, ACCENT_LIGHT, ACCENT_PALE, AMBER, BG, BRIGHT, CYAN, DIM, ERROR, FAINT, LIME,
+    MATCH_ACTIVE_BG, MATCH_BG, MUTED, MUTED_DARK, ORANGE, POPUP_BORDER, PURPLE, RULE, SUCCESS,
+    TEXT, YELLOW,
+};
+
+const KEYS: &[(&str, &str)] = &[
+    ("[h/←]", " prev "),
+    ("[l/→]", " next "),
+    ("[j/k]", " scroll "),
+    ("[d/u]", " page "),
+    ("[/]", " search "),
+    ("[g/G]", " first/last "),
+    ("[q]", " quit "),
+];
+
+const SEARCH_KEYS: &[(&str, &str)] = &[("[Esc]", " cancel "), ("[Enter]", " confirm ")];
 
 fn dim(s: &str) -> Span<'static> {
     s.to_owned().fg(DIM)
@@ -62,74 +67,6 @@ fn fmt_duration(nanos: u64) -> String {
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        s.chars()
-            .take(max.saturating_sub(1))
-            .chain(std::iter::once('…'))
-            .collect()
-    }
-}
-
-fn fill(buf: &mut Buffer, r: Rect, style: Style) {
-    for y in r.y..r.y + r.height {
-        for x in r.x..r.x + r.width {
-            if let Some(c) = buf.cell_mut((x, y)) {
-                c.set_char(' ');
-                c.set_style(style);
-            }
-        }
-    }
-}
-
-fn center(buf: &mut Buffer, area: Rect, y: u16, text: &str, style: Style) {
-    if y < area.y + area.height {
-        buf.set_string(
-            area.x + (area.width.saturating_sub(text.len() as u16)) / 2,
-            y,
-            text,
-            style,
-        );
-    }
-}
-
-fn draw_border(buf: &mut Buffer, r: Rect, title: &str, color: Color) {
-    let border = Style::reset().fg(color);
-    let bot = r.y + r.height - 1;
-    for &(y, l, ri) in &[(r.y, '╭', '╮'), (bot, '╰', '╯')] {
-        for x in r.x..r.x + r.width {
-            if let Some(c) = buf.cell_mut((x, y)) {
-                c.set_char(if x == r.x {
-                    l
-                } else if x == r.x + r.width - 1 {
-                    ri
-                } else {
-                    '─'
-                });
-                c.set_style(border);
-            }
-        }
-    }
-    if title.len() + 3 <= r.width as usize {
-        buf.set_string(
-            r.x + 2,
-            r.y,
-            title,
-            Style::reset().fg(BRIGHT).add_modifier(Modifier::BOLD),
-        );
-    }
-    for y in (r.y + 1)..bot {
-        for &x in &[r.x, r.x + r.width - 1] {
-            if let Some(c) = buf.cell_mut((x, y)) {
-                c.set_char('│');
-                c.set_style(border);
-            }
-        }
-    }
-}
-
 struct Dict<'a>(&'a profiles::ProfilesDictionary);
 
 impl Dict<'_> {
@@ -163,19 +100,19 @@ impl Dict<'_> {
             });
 
         match raw.as_deref() {
-            Some("native") => ("Native".into(), Color::Rgb(34, 197, 94)),
-            Some("kernel") => ("Kernel".into(), WARN),
+            Some("native") => ("Native".into(), SUCCESS),
+            Some("kernel") => ("Kernel".into(), ERROR),
             Some("jvm") => ("JVM".into(), ORANGE),
-            Some("cpython") => ("Python".into(), KEY),
+            Some("cpython") => ("Python".into(), YELLOW),
             Some("php" | "phpjit") => ("PHP".into(), PURPLE),
-            Some("ruby") => ("Ruby".into(), WARN),
-            Some("perl") => ("Perl".into(), Color::Rgb(96, 165, 250)),
-            Some("v8js") => ("JS".into(), KEY),
-            Some("dotnet") => (".NET".into(), Color::Rgb(96, 165, 250)),
+            Some("ruby") => ("Ruby".into(), ERROR),
+            Some("perl") => ("Perl".into(), ACCENT_LIGHT),
+            Some("v8js") => ("JS".into(), YELLOW),
+            Some("dotnet") => (".NET".into(), ACCENT_LIGHT),
             Some("beam") => ("Beam".into(), PURPLE),
-            Some("go") => ("Go".into(), Color::Rgb(6, 182, 212)),
-            Some(other) => (other.to_string(), Color::Rgb(100, 100, 120)),
-            None => ("Unknown".into(), Color::Rgb(100, 100, 120)),
+            Some("go") => ("Go".into(), CYAN),
+            Some(other) => (other.to_string(), MUTED_DARK),
+            None => ("Unknown".into(), MUTED_DARK),
         }
     }
 
@@ -257,17 +194,14 @@ impl Doc {
 
     fn section(&mut self, title: &str) {
         self.0.push(Line::from(vec![
-            format!("  ── {title} ").fg(SECTION).bold(),
-            "─"
-                .repeat(60usize.saturating_sub(title.len() + 5))
-                .fg(Color::Rgb(40, 45, 60)),
+            format!("  ── {title} ").fg(ACCENT_LIGHT).bold(),
+            "─".repeat(60usize.saturating_sub(title.len() + 5)).fg(RULE),
         ]));
     }
 
     fn subsection(&mut self, title: &str) {
-        self.0.push(Line::from(
-            format!("  ╌╌ {title}").fg(Color::Rgb(147, 197, 253)),
-        ));
+        self.0
+            .push(Line::from(format!("  ╌╌ {title}").fg(ACCENT_PALE)));
     }
 
     fn table(&mut self, title: &str, non_empty: bool, f: impl FnOnce(&mut Self)) {
@@ -299,9 +233,9 @@ impl Doc {
         let Some(a) = d.get_attr(idx) else { return };
         self.row(vec![
             prefix,
-            d.str(a.key_strindex).fg(KEY),
+            d.str(a.key_strindex).fg(YELLOW),
             dim(" = "),
-            d.any_val(a.value.as_ref()).fg(VAL),
+            d.any_val(a.value.as_ref()).fg(LIME),
         ]);
     }
 
@@ -334,10 +268,7 @@ impl Doc {
                 if s.is_empty() {
                     continue;
                 }
-                doc.row(vec![
-                    dim(&format!("  [{i:>4}] ")),
-                    s.clone().fg(Color::Rgb(180, 220, 180)),
-                ]);
+                doc.row(vec![dim(&format!("  [{i:>4}] ")), s.clone().fg(TEXT)]);
                 shown += 1;
                 if shown >= 200 {
                     doc.row(vec![dim(&format!(
@@ -353,15 +284,15 @@ impl Doc {
             for (i, m) in p.mapping_table.iter().enumerate().skip(1) {
                 doc.row(vec![
                     dim(&format!("  [{i}] ")),
-                    d.str(m.filename_strindex).fg(Color::Rgb(147, 197, 253)),
+                    d.str(m.filename_strindex).fg(ACCENT_PALE),
                 ]);
                 doc.row(vec![
                     dim("      mem: "),
-                    format!("0x{:x}", m.memory_start).fg(ADDR),
+                    format!("0x{:x}", m.memory_start).fg(AMBER),
                     dim(".."),
-                    format!("0x{:x}", m.memory_limit).fg(ADDR),
+                    format!("0x{:x}", m.memory_limit).fg(AMBER),
                     dim("  offset: "),
-                    format!("0x{:x}", m.file_offset).fg(ADDR),
+                    format!("0x{:x}", m.file_offset).fg(AMBER),
                 ]);
                 for &ai in &m.attribute_indices {
                     doc.attr(ai, d, dim("      "));
@@ -373,9 +304,9 @@ impl Doc {
             for (i, attr) in p.attribute_table.iter().enumerate().skip(1) {
                 doc.row(vec![
                     dim(&format!("  [{i:>3}] ")),
-                    d.str(attr.key_strindex).fg(KEY),
+                    d.str(attr.key_strindex).fg(YELLOW),
                     dim(" = "),
-                    d.any_val(attr.value.as_ref()).fg(VAL),
+                    d.any_val(attr.value.as_ref()).fg(LIME),
                 ]);
             }
         });
@@ -388,11 +319,11 @@ impl Doc {
                 ];
                 let sys = d.str(f.system_name_strindex);
                 if !sys.is_empty() {
-                    spans.extend([dim("  sys="), sys.fg(Color::Rgb(180, 180, 195))]);
+                    spans.extend([dim("  sys="), sys.fg(TEXT)]);
                 }
                 let file = d.str(f.filename_strindex);
                 if !file.is_empty() {
-                    spans.extend([dim("  file="), file.fg(Color::Rgb(130, 130, 150))]);
+                    spans.extend([dim("  file="), file.fg(MUTED)]);
                 }
                 if f.start_line > 0 {
                     spans.push(dim(&format!(":{}", f.start_line)));
@@ -414,9 +345,9 @@ impl Doc {
             for kv in &res.attributes {
                 self.row(vec![
                     dim("  "),
-                    kv.key.clone().fg(KEY),
+                    kv.key.clone().fg(YELLOW),
                     dim(" = "),
-                    fmt_any_val(kv.value.as_ref()).fg(VAL),
+                    fmt_any_val(kv.value.as_ref()).fg(LIME),
                 ]);
             }
         }
@@ -464,7 +395,7 @@ impl Doc {
         if p.dropped_attributes_count > 0 {
             self.row(vec![
                 dim("  dropped_attributes: "),
-                p.dropped_attributes_count.to_string().fg(WARN),
+                p.dropped_attributes_count.to_string().fg(ERROR),
             ]);
         }
         if !p.original_payload_format.is_empty() {
@@ -539,7 +470,7 @@ impl Doc {
                     if loc.lines.is_empty() {
                         self.row(vec![
                             conn.to_owned().fg(ACCENT),
-                            format!("{}+0x{:x}", d.mapping_name(loc), loc.address).fg(ADDR),
+                            format!("{}+0x{:x}", d.mapping_name(loc), loc.address).fg(AMBER),
                             tag,
                         ]);
                     } else {
@@ -652,23 +583,23 @@ impl DebugState {
             area,
             cy + 3,
             "Send OTLP profiles to inspect them",
-            bg.fg(Color::Rgb(100, 100, 120)),
+            bg.fg(MUTED_DARK),
         );
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
         let (cur, total) = (self.current + 1, self.requests.len());
-        let sep = " │ ".fg(Color::Rgb(55, 55, 65));
+        let sep = " │ ".fg(FAINT);
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 " ◆ ".fg(ACCENT),
                 "debug".fg(BRIGHT).bold(),
                 sep.clone(),
-                self.listen_addr.clone().fg(Color::Rgb(130, 130, 150)),
+                self.listen_addr.clone().fg(MUTED),
                 sep.clone(),
                 format!("Request {cur} of {total}").fg(BRIGHT).bold(),
                 sep,
-                format!("{total} queued").fg(Color::Rgb(110, 110, 130)),
+                format!("{total} queued").fg(MUTED_DARK),
             ])),
             area,
         );
@@ -696,9 +627,9 @@ impl DebugState {
                     return line;
                 }
                 let bg = if active_hit == Some(idx) {
-                    Color::Rgb(100, 80, 10)
+                    MATCH_ACTIVE_BG
                 } else {
-                    Color::Rgb(60, 50, 20)
+                    MATCH_BG
                 };
                 Line::from(
                     line.spans
@@ -720,7 +651,7 @@ impl DebugState {
                 0
             };
             let left = format!(" /{}", self.search.pattern).fg(BRIGHT);
-            let right = format!("[{cur}/{total}] ").fg(Color::Rgb(130, 130, 150));
+            let right = format!("[{cur}/{total}] ").fg(MUTED);
             let right_len = right.width() as u16;
 
             frame.render_widget(Paragraph::new(Line::from(vec![left])), area);
@@ -730,35 +661,17 @@ impl DebugState {
                 rx,
                 area.y,
                 right.content.as_ref(),
-                Style::default().fg(Color::Rgb(130, 130, 150)),
+                Style::default().fg(MUTED),
             );
             return;
         }
 
-        let (kf, df) = (Color::Rgb(80, 80, 100), Color::Rgb(55, 55, 65));
-        let hints: Vec<(&str, &str)> = if self.search.active {
-            vec![("[Esc]", " cancel "), ("[Enter]", " confirm ")]
+        let hints = if self.search.active {
+            SEARCH_KEYS
         } else {
-            let mut h = vec![
-                ("[h/←]", " prev "),
-                ("[l/→]", " next "),
-                ("[j/k]", " scroll "),
-                ("[d/u]", " page "),
-                ("[/]", " search "),
-            ];
-            h.extend([("[g/G]", " first/last "), ("[q]", " quit ")]);
-            h
+            KEYS
         };
-
-        let spans: Vec<Span> = hints
-            .iter()
-            .enumerate()
-            .flat_map(|(i, (k, d))| {
-                let p = if i == 0 { " " } else { "" };
-                [format!("{p}{k}").fg(kf), d.to_string().fg(df)]
-            })
-            .collect();
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        frame.render_widget(Paragraph::new(key_hints(hints)), area);
     }
 
     fn render_search_overlay(&self, frame: &mut Frame, area: Rect) {
@@ -776,8 +689,7 @@ impl DebugState {
             ph,
         );
         let buf = frame.buffer_mut();
-        fill(buf, popup, Style::reset());
-        draw_border(buf, popup, " search ", SEARCH_BORDER);
+        popup_frame(buf, popup, " search ", POPUP_BORDER);
         let iw = popup.width.saturating_sub(2) as usize;
         buf.set_string(
             popup.x + 1,

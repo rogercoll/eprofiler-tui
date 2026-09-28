@@ -4,6 +4,24 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
 use super::Action;
 use crate::storage::{ExecutableInfo, FileId};
+use crate::tui::theme;
+use crate::tui::widgets::{Cursor, Picker, PickerEvent, PickerStyle};
+
+pub const PATH_KEYS: &[(&str, &str)] = &[
+    ("[Esc]", " cancel "),
+    ("[Tab]", " complete "),
+    ("[↑↓]", " navigate "),
+    ("[Enter]", " load "),
+];
+
+static PATH_PICKER: PickerStyle = PickerStyle {
+    title: " executable path ",
+    placeholder: "type a path...",
+    border: theme::ACCENT,
+    width: 60,
+    max_visible: 5,
+    keys: PATH_KEYS,
+};
 
 #[derive(Clone)]
 pub struct ExeEntry {
@@ -12,39 +30,23 @@ pub struct ExeEntry {
     pub num_ranges: Option<u32>,
 }
 
-#[derive(Default)]
-pub struct PathInput {
-    pub active: bool,
-    pub input: String,
-    pub target: Option<String>,
-    pub completions: Vec<String>,
-    pub completion_cursor: usize,
+impl ExeEntry {
+    fn symbolized(&self) -> bool {
+        self.num_ranges.is_some()
+    }
 }
 
-impl PathInput {
-    pub fn open(&mut self, target: Option<String>) { *self = Self { active: true, target, ..Default::default() }; }
-
-    pub fn close(&mut self) { *self = Self::default(); }
-
-    fn refresh_completions(&mut self) {
-        self.completions = compute_path_completions(&self.input);
-        self.completion_cursor = 0;
-    }
-
-    fn apply_completion(&mut self) {
-        if let Some(selected) = self.completions.get(self.completion_cursor).cloned() {
-            self.input = selected;
-            self.refresh_completions();
-        }
-    }
+/// Path prompt plus the discovered mapping it will symbolize, if any.
+struct PathPrompt {
+    picker: Picker,
+    target: Option<String>,
 }
 
 pub struct ExecutablesTab {
-    pub cursor: usize,
-    pub scroll: usize,
+    pub cursor: Cursor,
     pub list: Vec<ExeEntry>,
     pub status: Option<String>,
-    pub path_input: PathInput,
+    prompt: Option<PathPrompt>,
 }
 
 impl From<Vec<ExecutableInfo>> for ExecutablesTab {
@@ -58,15 +60,18 @@ impl From<Vec<ExecutableInfo>> for ExecutablesTab {
                     num_ranges: Some(info.num_ranges),
                 })
                 .collect(),
-            cursor: 0,
-            scroll: 0,
+            cursor: Cursor::default(),
             status: None,
-            path_input: PathInput::default(),
+            prompt: None,
         }
     }
 }
 
 impl ExecutablesTab {
+    pub fn picker(&self) -> Option<&Picker> {
+        self.prompt.as_ref().map(|p| &p.picker)
+    }
+
     pub fn merge_discovered_mappings(&mut self, names: Vec<String>) {
         for name in names {
             if !self.list.iter().any(|e| e.name == name) {
@@ -130,98 +135,76 @@ impl ExecutablesTab {
         self.clear_symbols(&name);
     }
 
+    /// Symbolized entries first, then by name; the cursor follows its entry.
     fn sort_list(&mut self) {
-        let current_name = self.list.get(self.cursor).map(|e| e.name.clone());
+        let current_name = self.list.get(self.cursor.index).map(|e| e.name.clone());
         self.list.sort_by(|a, b| {
-            let a_sym = a.num_ranges.is_some();
-            let b_sym = b.num_ranges.is_some();
-            b_sym.cmp(&a_sym).then(a.name.cmp(&b.name))
+            b.symbolized()
+                .cmp(&a.symbolized())
+                .then(a.name.cmp(&b.name))
         });
-        if let Some(name) = current_name {
-            self.cursor = self
-                .list
-                .iter()
-                .position(|e| e.name == name)
-                .unwrap_or(self.cursor);
+        if let Some(pos) = current_name.and_then(|n| self.list.iter().position(|e| e.name == n)) {
+            self.cursor.index = pos;
         }
-        self.clamp_cursor();
+        self.cursor.clamp(self.list.len());
     }
 
-    fn clamp_cursor(&mut self) {
-        self.cursor = if self.list.is_empty() { 0 } else { self.cursor.min(self.list.len() - 1) };
-        if self.list.is_empty() { self.scroll = 0; }
-    }
-
-    pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Action {
-        if self.path_input.active {
-            return self.handle_path_input_key(key);
+    pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
+        if self.prompt.is_some() {
+            return self.handle_prompt_key(key);
         }
         match key.code {
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.cursor + 1 < self.list.len() {
-                    self.cursor += 1;
-                }
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.cursor = self.cursor.saturating_sub(1);
-            }
+            KeyCode::Down | KeyCode::Char('j') => self.cursor.next(self.list.len()),
+            KeyCode::Up | KeyCode::Char('k') => self.cursor.prev(),
             KeyCode::Enter => {
-                if let Some(entry) = self.list.get(self.cursor) {
-                    self.path_input.open(Some(entry.name.clone()));
+                let target = self.list.get(self.cursor.index).map(|e| e.name.clone());
+                if target.is_some() {
+                    self.open_prompt(target);
                 }
             }
             KeyCode::Char('r') => {
-                if let Some(entry) = self.list.get(self.cursor)
-                    && let Some(file_id) = entry.file_id
-                {
-                    return Action::RemoveSymbols(entry.name.clone(), file_id);
-                }
+                let entry = self.list.get(self.cursor.index)?;
+                return Some(Action::RemoveSymbols(entry.name.clone(), entry.file_id?));
             }
-            KeyCode::Char('/') => self.path_input.open(None),
+            KeyCode::Char('/') => self.open_prompt(None),
             _ => {}
         };
-        Action::None
+        None
     }
 
-    fn handle_path_input_key(&mut self, key: KeyEvent) -> Action {
-        match key.code {
-            KeyCode::Esc => self.path_input.close(),
-            KeyCode::Enter => {
-                let path = self.path_input.input.trim().to_string();
-                if !path.is_empty() {
-                    let target = self.path_input.target.take();
-                    let display = target.as_deref().unwrap_or(&path);
-                    self.status = Some(format!("Loading {}", display));
-                    self.path_input.close();
-                    return Action::LoadSymbols(PathBuf::from(&path), target);
+    fn open_prompt(&mut self, target: Option<String>) {
+        let mut picker = Picker::new(&PATH_PICKER);
+        picker.set_items(path_completions(""));
+        self.prompt = Some(PathPrompt { picker, target });
+    }
+
+    fn handle_prompt_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let prompt = self.prompt.as_mut()?;
+        match prompt.picker.handle_key(key)? {
+            PickerEvent::Changed => {
+                let items = path_completions(&prompt.picker.input);
+                prompt.picker.set_items(items);
+                None
+            }
+            PickerEvent::Cancel => {
+                self.prompt = None;
+                None
+            }
+            PickerEvent::Submit => {
+                let PathPrompt { picker, target } = self.prompt.take()?;
+                let path = picker.input.trim();
+                if path.is_empty() {
+                    return None;
                 }
-                self.path_input.close();
+                self.status = Some(format!("Loading {}", target.as_deref().unwrap_or(path)));
+                Some(Action::LoadSymbols(PathBuf::from(path), target))
             }
-            KeyCode::Backspace => {
-                self.path_input.input.pop();
-                self.path_input.refresh_completions();
-            }
-            KeyCode::Tab => self.path_input.apply_completion(),
-            KeyCode::Up => {
-                self.path_input.completion_cursor =
-                    self.path_input.completion_cursor.saturating_sub(1);
-            }
-            KeyCode::Down => {
-                if self.path_input.completion_cursor + 1 < self.path_input.completions.len() {
-                    self.path_input.completion_cursor += 1;
-                }
-            }
-            KeyCode::Char(c) => {
-                self.path_input.input.push(c);
-                self.path_input.refresh_completions();
-            }
-            _ => {}
-        };
-        Action::None
+        }
     }
 }
 
-fn compute_path_completions(input: &str) -> Vec<String> {
+/// Filesystem entries completing `input`, directories suffixed with `/`.
+fn path_completions(input: &str) -> Vec<String> {
     if input.is_empty() {
         return list_dir_entries(Path::new("."), "");
     }
@@ -244,20 +227,18 @@ fn list_dir_entries(dir: &Path, prefix: &str) -> Vec<String> {
     let prefix_lower = prefix.to_lowercase();
     let mut results: Vec<String> = entries
         .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
-                return None;
-            }
-            if name.starts_with('.') && prefix.is_empty() {
-                return None;
-            }
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            let hidden = name.starts_with('.') && prefix.is_empty();
+            !hidden && name.starts_with(&prefix_lower)
+        })
+        .map(|entry| {
             let full = entry.path().to_string_lossy().into_owned();
-            Some(if entry.path().is_dir() {
+            if entry.path().is_dir() {
                 format!("{full}/")
             } else {
                 full
-            })
+            }
         })
         .collect();
     results.sort();

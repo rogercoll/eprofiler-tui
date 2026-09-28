@@ -65,10 +65,6 @@ impl FlamescopeLayout {
     pub fn bottom(&self) -> u16 {
         self.area.y + self.area.height
     }
-
-    pub fn right(&self) -> u16 {
-        self.area.x + self.area.width
-    }
 }
 
 #[cfg(test)]

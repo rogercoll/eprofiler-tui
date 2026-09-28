@@ -12,75 +12,29 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::storage::{ExecutableInfo, FileId};
 use crate::tui::event::Event;
+use crate::tui::widgets::Picker;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActiveTab {
     Flamegraph,
     Flamescope,
     Executables,
 }
 
+impl ActiveTab {
+    fn next(self) -> Self {
+        match self {
+            Self::Flamegraph => Self::Flamescope,
+            Self::Flamescope => Self::Executables,
+            Self::Executables => Self::Flamegraph,
+        }
+    }
+}
+
+/// Side effect requested by the state; executed by the caller.
 pub enum Action {
     LoadSymbols(PathBuf, Option<String>),
     RemoveSymbols(String, FileId),
-    None,
-}
-
-/// Shared search overlay used by multiple tabs.
-#[derive(Default)]
-pub struct SearchOverlay {
-    pub active: bool,
-    pub input: String,
-    pub matches: Vec<String>,
-    pub cursor: usize,
-}
-
-pub enum SearchAction {
-    None,
-    Closed,
-    Selected(Option<String>),
-    Refresh,
-}
-
-impl SearchOverlay {
-    pub fn open(&mut self) { *self = Self { active: true, ..Default::default() }; }
-
-    pub fn close(&mut self) { *self = Self::default(); }
-
-    pub fn handle_key(&mut self, key: KeyEvent) -> SearchAction {
-        match key.code {
-            KeyCode::Esc => {
-                self.close();
-                SearchAction::Closed
-            }
-            KeyCode::Enter => {
-                let selected = self.matches.get(self.cursor).cloned();
-                self.close();
-                SearchAction::Selected(selected)
-            }
-            KeyCode::Backspace => {
-                self.input.pop();
-                self.cursor = 0;
-                SearchAction::Refresh
-            }
-            KeyCode::Up => {
-                self.cursor = self.cursor.saturating_sub(1);
-                SearchAction::None
-            }
-            KeyCode::Down => {
-                if self.cursor + 1 < self.matches.len() {
-                    self.cursor += 1;
-                }
-                SearchAction::None
-            }
-            KeyCode::Char(c) => {
-                self.input.push(c);
-                self.cursor = 0;
-                SearchAction::Refresh
-            }
-            _ => SearchAction::None,
-        }
-    }
 }
 
 pub struct State {
@@ -104,10 +58,19 @@ impl State {
         }
     }
 
-    /// Central event handler: mutates state and returns an Action for side effects.
-    pub fn handle_event(&mut self, event: Event) -> Action {
+    /// The picker open on the active tab, if any.
+    pub fn active_picker(&self) -> Option<&Picker> {
+        match self.active_tab {
+            ActiveTab::Flamegraph => self.fg.picker.as_ref(),
+            ActiveTab::Flamescope => self.fs.picker.as_ref(),
+            ActiveTab::Executables => self.exe.picker(),
+        }
+    }
+
+    /// Central event handler: mutates state and returns any side effect to run.
+    pub fn handle_event(&mut self, event: Event) -> Option<Action> {
         match event {
-            Event::Tick | Event::Resize => Action::None,
+            Event::Tick | Event::Resize => None,
             Event::Key(key) => self.handle_key(key),
             Event::ProfileUpdate {
                 flamegraph,
@@ -118,50 +81,140 @@ impl State {
                     self.fs.record_timestamps(&timestamps);
                 }
                 self.fg.merge(flamegraph, samples);
-                Action::None
+                None
             }
             Event::MappingsDiscovered(names) => {
                 self.exe.merge_discovered_mappings(names);
-                Action::None
+                None
             }
             Event::SymbolsLoaded { target_name, info } => {
                 self.exe.handle_symbols_loaded(target_name, info);
-                Action::None
+                None
             }
             Event::SymbolsRemoved { name, error } => {
                 self.exe.handle_symbols_removed(name, error);
-                Action::None
+                None
             }
         }
     }
 
-    fn handle_key(&mut self, key: KeyEvent) -> Action {
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.running = false;
-            return Action::None;
-        }
+    fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let ctrl_c =
+            key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+        let picker_open = self.active_picker().is_some();
 
-        let overlay_active =
-            self.fg.search.active || self.fs.search.active || self.exe.path_input.active;
-
-        if key.code == KeyCode::Tab && !overlay_active {
-            self.active_tab = match self.active_tab {
-                ActiveTab::Flamegraph => ActiveTab::Flamescope,
-                ActiveTab::Flamescope => ActiveTab::Executables,
-                ActiveTab::Executables => ActiveTab::Flamegraph,
-            };
-            return Action::None;
+        match key.code {
+            _ if ctrl_c => self.running = false,
+            KeyCode::Char('q') | KeyCode::Char('Q') if !picker_open => self.running = false,
+            KeyCode::Tab if !picker_open => self.active_tab = self.active_tab.next(),
+            _ => {
+                return match self.active_tab {
+                    ActiveTab::Flamegraph => {
+                        self.fg.handle_key(key);
+                        None
+                    }
+                    ActiveTab::Flamescope => {
+                        self.fs.handle_key(key);
+                        None
+                    }
+                    ActiveTab::Executables => self.exe.handle_key(key),
+                };
+            }
         }
+        None
+    }
+}
 
-        if matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q')) && !overlay_active {
-            self.running = false;
-            return Action::None;
-        }
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
 
-        match self.active_tab {
-            ActiveTab::Flamegraph => { self.fg.handle_key(key); Action::None }
-            ActiveTab::Flamescope => { self.fs.handle_key(key); Action::None }
-            ActiveTab::Executables => self.exe.handle_key(key),
+    use super::*;
+    use crate::flamegraph::FlameGraph;
+
+    fn key(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn type_str(state: &mut State, s: &str) {
+        for c in s.chars() {
+            state.handle_event(key(KeyCode::Char(c)));
         }
+    }
+
+    fn populated_state() -> State {
+        let mut state = State::new("addr".into(), vec![]);
+        let mut fg = FlameGraph::new();
+        fg.add_stack(&["worker-1".into(), "main".into()], 5);
+        fg.add_stack(&["other".into(), "main".into()], 5);
+        let timestamps = HashMap::from([("worker-1".to_string(), vec![0u64])]);
+        state.handle_event(Event::ProfileUpdate {
+            flamegraph: fg,
+            samples: 10,
+            timestamps,
+        });
+        state.handle_event(Event::MappingsDiscovered(vec!["app".into()]));
+        state
+    }
+
+    #[test]
+    fn quit_keys_are_swallowed_while_a_picker_is_open() {
+        let mut state = populated_state();
+        state.handle_event(key(KeyCode::Char('/')));
+        state.handle_event(key(KeyCode::Char('q')));
+        state.handle_event(key(KeyCode::Tab));
+        assert!(state.running);
+        assert_eq!(state.active_tab, ActiveTab::Flamegraph);
+        assert_eq!(state.fg.picker.as_ref().unwrap().input, "q");
+    }
+
+    #[test]
+    fn flamegraph_search_zooms_into_the_picked_thread() {
+        let mut state = populated_state();
+        state.handle_event(key(KeyCode::Char('/')));
+        type_str(&mut state, "WORK");
+        state.handle_event(key(KeyCode::Enter));
+        assert!(state.fg.picker.is_none());
+        assert_eq!(state.fg.zoom_path, vec!["worker-1".to_string()]);
+    }
+
+    #[test]
+    fn flamescope_search_filters_by_thread() {
+        let mut state = populated_state();
+        state.handle_event(key(KeyCode::Tab));
+        state.handle_event(key(KeyCode::Char('/')));
+        type_str(&mut state, "worker");
+        state.handle_event(key(KeyCode::Enter));
+        assert_eq!(state.fs.filter.as_deref(), Some("worker-1"));
+        assert!(state.fs.auto_scroll);
+    }
+
+    #[test]
+    fn executables_prompt_returns_a_load_action_with_target() {
+        let mut state = populated_state();
+        state.handle_event(key(KeyCode::Tab));
+        state.handle_event(key(KeyCode::Tab));
+        assert!(state.handle_event(key(KeyCode::Enter)).is_none());
+        type_str(&mut state, "/bin/ls");
+        let action = state.handle_event(key(KeyCode::Enter));
+        match action {
+            Some(Action::LoadSymbols(path, target)) => {
+                assert_eq!(path, PathBuf::from("/bin/ls"));
+                assert_eq!(target.as_deref(), Some("app"));
+            }
+            _ => panic!("expected LoadSymbols"),
+        }
+        assert_eq!(state.exe.status.as_deref(), Some("Loading app"));
+        assert!(state.exe.picker().is_none());
+    }
+
+    #[test]
+    fn empty_path_submission_is_a_cancel() {
+        let mut state = populated_state();
+        state.handle_event(key(KeyCode::Tab));
+        state.handle_event(key(KeyCode::Tab));
+        state.handle_event(key(KeyCode::Char('/')));
+        assert!(state.handle_event(key(KeyCode::Enter)).is_none());
+        assert!(state.exe.picker().is_none());
     }
 }

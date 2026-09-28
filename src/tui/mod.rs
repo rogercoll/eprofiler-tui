@@ -6,8 +6,11 @@ use std::{io, panic};
 
 use crate::error::Result;
 
+pub(crate) mod draw;
 pub(crate) mod event;
 pub(crate) mod state;
+pub(crate) mod theme;
+pub(crate) mod widgets;
 
 mod flamescope_layout;
 mod ui;

@@ -75,8 +75,8 @@ fn main() -> Result<()> {
         tui.draw(&mut state)?;
 
         match state.handle_event(tui.events.next()?) {
-            Action::None => {}
-            Action::LoadSymbols(path, target_name) => {
+            None => {}
+            Some(Action::LoadSymbols(path, target_name)) => {
                 spawn_symbol_load(
                     Arc::clone(&store),
                     tui.events.sender.clone(),
@@ -84,7 +84,7 @@ fn main() -> Result<()> {
                     target_name,
                 );
             }
-            Action::RemoveSymbols(name, file_id) => {
+            Some(Action::RemoveSymbols(name, file_id)) => {
                 state.exe.status = Some(format!("Removing {name}"));
                 spawn_symbol_remove(Arc::clone(&store), tui.events.sender.clone(), name, file_id);
             }
