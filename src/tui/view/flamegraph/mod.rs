@@ -1,7 +1,6 @@
 //! Icicle-style flamegraph: the root on top, one row per stack depth.
 
 mod layout;
-mod legend;
 
 use ratatui::{
     buffer::Buffer,
@@ -14,13 +13,11 @@ use ratatui::{
 use super::TabView;
 use super::chrome::{DetailLine, Keys, Placeholder};
 use crate::tui::canvas::BufferExt;
-use crate::tui::palette::Paint;
 use crate::tui::state::FlamegraphTab;
 use crate::tui::text::{format_count, truncate};
 use crate::tui::theme::{self, ColorExt};
 use crate::tui::widgets::Cursor;
 use layout::{FlameLayout, FrameRect};
-use legend::Legend;
 
 impl TabView for FlamegraphTab {
     const KEYS: Keys = &[
@@ -32,7 +29,6 @@ impl TabView for FlamegraphTab {
         ("[Enter]", " zoom "),
         ("[Esc]", " back "),
         ("[/]", " search "),
-        ("[?]", " colors "),
         ("[r]", " reset "),
     ];
 
@@ -77,10 +73,6 @@ impl TabView for FlamegraphTab {
             if !frames.iter().any(|f| f.depth == depth) {
                 painter.empty_row(buf, depth);
             }
-        }
-
-        if self.show_legend {
-            Legend.render(area, buf);
         }
     }
 
@@ -256,19 +248,5 @@ mod tests {
         let mut state = populated_state();
         state.handle_event(key(KeyCode::Down));
         assert!(screen(&mut state, 120, 20).contains("■ Unknown"));
-    }
-
-    #[test]
-    fn legend_toggles_and_lists_runtimes() {
-        let mut state = populated_state();
-        let note = "brighter = more self time";
-        assert!(!screen(&mut state, 100, 30).contains(note));
-        state.handle_event(key(KeyCode::Char('?')));
-        let shown = screen(&mut state, 100, 30);
-        for label in ["colors", "Native", "Python", ".NET", note] {
-            assert!(shown.contains(label), "missing {label}: {shown}");
-        }
-        state.handle_event(key(KeyCode::Char('?')));
-        assert!(!screen(&mut state, 100, 30).contains(note));
     }
 }

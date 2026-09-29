@@ -15,21 +15,10 @@ use ratatui::style::Color;
 
 use crate::frame::{FrameKind, Origin, Runtime};
 
-/// Colors for flamegraph frames.
-pub trait Paint {
-    /// Color of a frame with this kind, label `name` and self-time ratio.
-    fn color(&self, name: &str, self_ratio: f64) -> Color;
-    /// Representative color for the legend: medium self time, no jitter.
-    fn swatch(&self) -> Color;
-}
-
-impl Paint for FrameKind {
-    fn color(&self, name: &str, self_ratio: f64) -> Color {
+impl FrameKind {
+    /// Flamegraph color of a frame with this kind, label `name` and self-time ratio.
+    pub fn color(&self, name: &str, self_ratio: f64) -> Color {
         Band::of(self.runtime).shade(*self, self_ratio, Jitter::of(name))
-    }
-
-    fn swatch(&self) -> Color {
-        Band::of(self.runtime).shade(*self, 0.5, Jitter::NONE)
     }
 }
 
@@ -156,11 +145,6 @@ struct Jitter {
 }
 
 impl Jitter {
-    const NONE: Self = Self {
-        hue: 0.0,
-        light: 0.0,
-    };
-
     fn of(name: &str) -> Self {
         // FNV-1a: stable across runs and platforms, unlike `DefaultHasher`.
         let hash = name.bytes().fold(0xcbf29ce484222325u64, |h, b| {
@@ -208,16 +192,32 @@ mod tests {
         FrameKind::new(runtime, origin)
     }
 
+    /// Every runtime that has a hue.
+    const HUED: [Runtime; 11] = [
+        Runtime::Native,
+        Runtime::Kernel,
+        Runtime::Jvm,
+        Runtime::Go,
+        Runtime::Python,
+        Runtime::Js,
+        Runtime::Ruby,
+        Runtime::Php,
+        Runtime::Dotnet,
+        Runtime::Beam,
+        Runtime::Perl,
+    ];
+
+    /// Reference color: medium self time, no per-name jitter.
     fn swatch(runtime: Runtime, origin: Origin) -> Color {
-        kind(runtime, origin).swatch()
+        let still = Jitter {
+            hue: 0.0,
+            light: 0.0,
+        };
+        Band::of(runtime).shade(kind(runtime, origin), 0.5, still)
     }
 
     fn hsl(h: f64, s: f64, l: f64) -> Color {
         Hsl { h, s, l }.into()
-    }
-
-    fn has_hue(runtime: Runtime) -> bool {
-        !matches!(runtime, Runtime::Unknown | Runtime::Thread)
     }
 
     fn rgb(c: Color) -> (u8, u8, u8) {
@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn runtime_frames_are_pastel_except_kernel() {
-        for runtime in Runtime::ALL.into_iter().filter(|r| has_hue(*r)) {
+        for runtime in HUED {
             let app = swatch(runtime, Origin::Application);
             let rt = swatch(runtime, Origin::Runtime);
             if runtime == Runtime::Kernel {
@@ -286,9 +286,8 @@ mod tests {
 
     #[test]
     fn every_runtime_hue_is_distinct() {
-        let colors: std::collections::HashSet<_> = Runtime::ALL
+        let colors: std::collections::HashSet<_> = HUED
             .iter()
-            .filter(|r| has_hue(**r))
             .map(|r| rgb(swatch(*r, Origin::Application)))
             .collect();
         assert_eq!(colors.len(), 11);

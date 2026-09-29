@@ -28,23 +28,6 @@ pub enum Runtime {
 }
 
 impl Runtime {
-    /// Every runtime, in legend order.
-    pub const ALL: [Runtime; 13] = [
-        Self::Native,
-        Self::Kernel,
-        Self::Jvm,
-        Self::Go,
-        Self::Python,
-        Self::Js,
-        Self::Ruby,
-        Self::Php,
-        Self::Dotnet,
-        Self::Beam,
-        Self::Perl,
-        Self::Unknown,
-        Self::Thread,
-    ];
-
     pub fn from_otlp(frame_type: &str) -> Self {
         match frame_type {
             "native" => Self::Native,
