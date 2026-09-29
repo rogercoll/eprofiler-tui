@@ -96,7 +96,7 @@ pub(crate) mod testing {
     };
 
     use super::Screen;
-    use crate::flamegraph::FlameGraph;
+    use crate::flamegraph::SampledStack;
     use crate::tui::event::Event;
     use crate::tui::state::State;
 
@@ -107,11 +107,11 @@ pub(crate) mod testing {
     /// Two threads, a flamescope sample and two discovered executables.
     pub fn populated_state() -> State {
         let mut state = State::new("0.0.0.0:4317".into(), vec![]);
-        let mut fg = FlameGraph::new();
-        fg.add_stack(&["worker-1".into(), "main".into(), "do_work".into()], 30);
-        fg.add_stack(&["worker-2".into(), "main".into()], 10);
         state.handle_event(Event::ProfileUpdate {
-            flamegraph: fg,
+            stacks: vec![
+                SampledStack::from_names(&["worker-1", "main", "do_work"], 30),
+                SampledStack::from_names(&["worker-2", "main"], 10),
+            ],
             samples: 40,
             timestamps: HashMap::from([("worker-1".into(), vec![0u64, 1_500_000_000])]),
         });

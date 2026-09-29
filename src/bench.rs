@@ -112,7 +112,7 @@ impl Report {
             report.decode += time;
             report.decode_heap += heap;
             let event = Event::ProfileUpdate {
-                flamegraph: batch.flamegraph,
+                stacks: batch.stacks,
                 samples: batch.samples,
                 timestamps: batch.timestamps,
             };
