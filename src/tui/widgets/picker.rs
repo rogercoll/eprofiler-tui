@@ -13,7 +13,9 @@ use ratatui::{
 };
 
 use super::Cursor;
-use crate::tui::{draw, theme};
+use crate::tui::canvas::BufferExt;
+use crate::tui::text::truncate;
+use crate::tui::theme;
 
 /// Static presentation and key-hint data for one kind of picker.
 pub struct PickerStyle {
@@ -119,21 +121,17 @@ impl Widget for &Picker {
             width,
             height,
         );
-        draw::popup_frame(buf, popup, self.style.title, self.style.border);
+        buf.popup(popup, self.style.title, self.style.border);
 
         let inner_w = popup.width.saturating_sub(2) as usize;
-        let prompt = format!(
-            " / {}█",
-            draw::truncate(&self.input, inner_w.saturating_sub(5))
-        );
+        let prompt = format!(" / {}█", truncate(&self.input, inner_w.saturating_sub(5)));
         buf.set_string(
             popup.x + 1,
             popup.y + 1,
-            draw::truncate(&prompt, inner_w),
+            truncate(&prompt, inner_w),
             Style::reset().fg(theme::BRIGHT),
         );
-        draw::hline(
-            buf,
+        buf.hline(
             popup.y + 2,
             popup.x + 1,
             popup.right() - 1,
@@ -180,17 +178,13 @@ impl Widget for &Picker {
             let mut style = Style::reset().fg(fg);
             if selected {
                 style = style.bg(theme::HIGHLIGHT_BG).add_modifier(Modifier::BOLD);
-                draw::fill(
-                    buf,
+                buf.fill(
                     Rect::new(popup.x + 1, y, popup.width - 2, 1),
                     Style::reset().bg(theme::HIGHLIGHT_BG),
                 );
             }
             let prefix = if selected { " ▸ " } else { "   " };
-            let text = format!(
-                "{prefix}{}",
-                draw::truncate(item, inner_w.saturating_sub(3))
-            );
+            let text = format!("{prefix}{}", truncate(item, inner_w.saturating_sub(3)));
             buf.set_string(popup.x + 1, y, text, style);
         }
     }

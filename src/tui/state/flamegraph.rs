@@ -173,7 +173,7 @@ impl FlamegraphTab {
         if self.cursor_path.is_empty() {
             return;
         }
-        let names = collect_path_names(self.zoom_root(), &self.cursor_path);
+        let names = self.zoom_root().names_along(&self.cursor_path);
         self.zoom_path.extend(names);
         self.reset_cursor();
     }
@@ -196,15 +196,4 @@ impl FlamegraphTab {
             ..Self::default()
         };
     }
-}
-
-fn collect_path_names(root: &FlameNode, index_path: &[usize]) -> Vec<String> {
-    index_path
-        .iter()
-        .scan(root, |node, &idx| {
-            let child = node.children.get(idx)?;
-            *node = child;
-            Some(child.name.clone())
-        })
-        .collect()
 }

@@ -101,6 +101,18 @@ impl FlameNode {
             .fold(self, |node, &idx| node.children.get(idx).unwrap_or(node))
     }
 
+    /// Names of the nodes along `indices` below this one, stopping at the
+    /// first index that is out of bounds.
+    pub fn names_along(&self, indices: &[usize]) -> Vec<String> {
+        indices
+            .iter()
+            .scan(self, |node, &idx| {
+                *node = node.children.get(idx)?;
+                Some(node.name.clone())
+            })
+            .collect()
+    }
+
     /// Walk down child indices; `None` if any index is out of bounds.
     pub fn descend(&self, indices: &[usize]) -> Option<&FlameNode> {
         indices
@@ -124,83 +136,4 @@ impl FlameGraph {
     pub fn add_stack(&mut self, stack: &[Frame], value: i64) {
         self.root.add_stack(stack, value);
     }
-}
-
-/// A node placed on screen: horizontal extent in cells and its depth row.
-pub struct FrameRect<'a> {
-    pub x: u16,
-    pub width: u16,
-    pub depth: usize,
-    pub node: &'a FlameNode,
-}
-
-/// Place every node under `root` that is at least one cell wide.
-pub fn layout_frames(root: &FlameNode, area_width: u16) -> Vec<FrameRect<'_>> {
-    if root.total_value <= 0 {
-        return Vec::new();
-    }
-    let scale = area_width as f64 / root.total_value as f64;
-    let mut frames = Vec::new();
-    layout_recursive(root, 0.0, 0, scale, &mut frames);
-    frames
-}
-
-fn layout_recursive<'a>(
-    node: &'a FlameNode,
-    x_float: f64,
-    depth: usize,
-    scale: f64,
-    frames: &mut Vec<FrameRect<'a>>,
-) {
-    let x_end = x_float + node.total_value as f64 * scale;
-    let x = x_float.round() as u16;
-    let width = (x_end.round() as u16).saturating_sub(x);
-    if width == 0 {
-        return;
-    }
-    frames.push(FrameRect {
-        x,
-        width,
-        depth,
-        node,
-    });
-
-    let mut child_x = x_float;
-    for child in &node.children {
-        layout_recursive(child, child_x, depth + 1, scale, frames);
-        child_x += child.total_value as f64 * scale;
-    }
-}
-
-/// Screen extent of the node at `cursor_path` below `root`, even if it is
-/// narrower than one cell.
-pub fn cursor_frame_rect<'a>(
-    root: &'a FlameNode,
-    cursor_path: &[usize],
-    area_width: u16,
-) -> Option<FrameRect<'a>> {
-    if root.total_value <= 0 {
-        return None;
-    }
-    let scale = area_width as f64 / root.total_value as f64;
-    let mut node = root;
-    let mut x_acc = 0.0;
-
-    for &idx in cursor_path {
-        let preceding: i64 = node
-            .children
-            .get(..idx)?
-            .iter()
-            .map(|c| c.total_value)
-            .sum();
-        x_acc += preceding as f64 * scale;
-        node = node.children.get(idx)?;
-    }
-
-    Some(FrameRect {
-        x: x_acc.round() as u16,
-        width: (node.total_value as f64 * scale).round().max(1.0) as u16,
-        depth: cursor_path.len(),
-        node,
-    })
 }

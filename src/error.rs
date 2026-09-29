@@ -8,8 +8,6 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("Channel receive error: {0}")]
     Recv(#[from] std::sync::mpsc::RecvError),
-    #[error("gRPC transport error: {0}")]
-    Grpc(#[from] tonic::transport::Error),
     #[error("symbolization parsing error: {0}")]
     SymParsing(#[from] symblib::objfile::Error),
     #[error("symbolization dwarf parsing error: {0}")]
@@ -22,4 +20,6 @@ pub enum Error {
     Storage(#[from] fjall::Error),
     #[error("incompatible storage format at `{}`: delete the directory and restart", .0.display())]
     StorageVersionMismatch(PathBuf),
+    #[error("cannot determine the home directory; pass --data-dir")]
+    NoHomeDir,
 }

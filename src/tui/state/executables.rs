@@ -23,11 +23,21 @@ static PATH_PICKER: PickerStyle = PickerStyle {
     keys: PATH_KEYS,
 };
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct ExeEntry {
     pub name: String,
     pub file_id: Option<FileId>,
     pub num_ranges: Option<u32>,
+}
+
+impl From<ExecutableInfo> for ExeEntry {
+    fn from(info: ExecutableInfo) -> Self {
+        Self {
+            name: info.file_name,
+            file_id: Some(info.file_id),
+            num_ranges: Some(info.num_ranges),
+        }
+    }
 }
 
 impl ExeEntry {
@@ -42,6 +52,52 @@ struct PathPrompt {
     target: Option<String>,
 }
 
+impl PathPrompt {
+    /// Filesystem entries completing `input`, directories suffixed with `/`.
+    fn completions(input: &str) -> Vec<String> {
+        if input.is_empty() {
+            return Self::entries(Path::new("."), "");
+        }
+        let path = Path::new(input);
+        if input.ends_with('/') {
+            return Self::entries(path, "");
+        }
+        let parent = path.parent().unwrap_or(Path::new("."));
+        let prefix = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        Self::entries(parent, &prefix)
+    }
+
+    /// Entries of `dir` whose names start with `prefix`, case-insensitively,
+    /// sorted. Hidden entries are listed only once the prefix is typed.
+    fn entries(dir: &Path, prefix: &str) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let prefix_lower = prefix.to_lowercase();
+        let mut results: Vec<String> = entries
+            .flatten()
+            .filter(|entry| {
+                let name = entry.file_name().to_string_lossy().to_lowercase();
+                let hidden = name.starts_with('.') && prefix.is_empty();
+                !hidden && name.starts_with(&prefix_lower)
+            })
+            .map(|entry| {
+                let full = entry.path().to_string_lossy().into_owned();
+                if entry.path().is_dir() {
+                    format!("{full}/")
+                } else {
+                    full
+                }
+            })
+            .collect();
+        results.sort();
+        results
+    }
+}
+
 pub struct ExecutablesTab {
     pub cursor: Cursor,
     pub list: Vec<ExeEntry>,
@@ -52,14 +108,7 @@ pub struct ExecutablesTab {
 impl From<Vec<ExecutableInfo>> for ExecutablesTab {
     fn from(exes: Vec<ExecutableInfo>) -> Self {
         Self {
-            list: exes
-                .into_iter()
-                .map(|info| ExeEntry {
-                    name: info.file_name,
-                    file_id: Some(info.file_id),
-                    num_ranges: Some(info.num_ranges),
-                })
-                .collect(),
+            list: exes.into_iter().map(ExeEntry::from).collect(),
             cursor: Cursor::default(),
             status: None,
             prompt: None,
@@ -77,8 +126,7 @@ impl ExecutablesTab {
             if !self.list.iter().any(|e| e.name == name) {
                 self.list.push(ExeEntry {
                     name,
-                    file_id: None,
-                    num_ranges: None,
+                    ..Default::default()
                 });
             }
         }
@@ -90,11 +138,7 @@ impl ExecutablesTab {
             entry.file_id = Some(info.file_id);
             entry.num_ranges = Some(info.num_ranges);
         } else {
-            self.list.push(ExeEntry {
-                name: info.file_name,
-                file_id: Some(info.file_id),
-                num_ranges: Some(info.num_ranges),
-            });
+            self.list.push(info.into());
         }
         self.sort_list();
     }
@@ -164,7 +208,9 @@ impl ExecutablesTab {
             }
             KeyCode::Char('r') => {
                 let entry = self.list.get(self.cursor.index)?;
-                return Some(Action::RemoveSymbols(entry.name.clone(), entry.file_id?));
+                let (name, file_id) = (entry.name.clone(), entry.file_id?);
+                self.status = Some(format!("Removing {name}"));
+                return Some(Action::RemoveSymbols(name, file_id));
             }
             KeyCode::Char('/') => self.open_prompt(None),
             _ => {}
@@ -174,7 +220,7 @@ impl ExecutablesTab {
 
     fn open_prompt(&mut self, target: Option<String>) {
         let mut picker = Picker::new(&PATH_PICKER);
-        picker.set_items(path_completions(""));
+        picker.set_items(PathPrompt::completions(""));
         self.prompt = Some(PathPrompt { picker, target });
     }
 
@@ -182,7 +228,7 @@ impl ExecutablesTab {
         let prompt = self.prompt.as_mut()?;
         match prompt.picker.handle_key(key)? {
             PickerEvent::Changed => {
-                let items = path_completions(&prompt.picker.input);
+                let items = PathPrompt::completions(&prompt.picker.input);
                 prompt.picker.set_items(items);
                 None
             }
@@ -201,46 +247,4 @@ impl ExecutablesTab {
             }
         }
     }
-}
-
-/// Filesystem entries completing `input`, directories suffixed with `/`.
-fn path_completions(input: &str) -> Vec<String> {
-    if input.is_empty() {
-        return list_dir_entries(Path::new("."), "");
-    }
-    let path = Path::new(input);
-    if input.ends_with('/') {
-        return list_dir_entries(path, "");
-    }
-    let parent = path.parent().unwrap_or(Path::new("."));
-    let prefix = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    list_dir_entries(parent, &prefix)
-}
-
-fn list_dir_entries(dir: &Path, prefix: &str) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return vec![];
-    };
-    let prefix_lower = prefix.to_lowercase();
-    let mut results: Vec<String> = entries
-        .flatten()
-        .filter(|entry| {
-            let name = entry.file_name().to_string_lossy().to_lowercase();
-            let hidden = name.starts_with('.') && prefix.is_empty();
-            !hidden && name.starts_with(&prefix_lower)
-        })
-        .map(|entry| {
-            let full = entry.path().to_string_lossy().into_owned();
-            if entry.path().is_dir() {
-                format!("{full}/")
-            } else {
-                full
-            }
-        })
-        .collect();
-    results.sort();
-    results
 }

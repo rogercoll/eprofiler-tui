@@ -1,246 +1,65 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock, mpsc};
+//! OTLP profiles gRPC receiver: accepts export requests and forwards the
+//! decoded data to the UI as events.
+
+use std::net::SocketAddr;
+use std::sync::{Arc, mpsc};
+
+use eprofiler_proto::opentelemetry::proto::collector::profiles::v1development as collector;
+use tonic::codec::CompressionEncoding;
 use tonic::{Request, Response, Status};
 
-use crate::flamegraph::FlameGraph;
-use crate::frame::{Frame, FrameInfo, FrameKind, Runtime, classify};
+use crate::otlp::{Decoder, KnownMappings};
 use crate::storage::SymbolStore;
 use crate::tui::event::Event;
-use eprofiler_proto::opentelemetry::proto::collector::profiles::v1development as collector;
-use eprofiler_proto::opentelemetry::proto::common::v1 as common;
-use eprofiler_proto::opentelemetry::proto::profiles::v1development as profiles;
 
 pub struct ProfilesServer {
-    event_tx: mpsc::Sender<Event>,
+    events: mpsc::Sender<Event>,
     store: Arc<SymbolStore>,
-    known_basenames: Arc<RwLock<HashSet<String>>>,
+    known: Arc<KnownMappings>,
 }
 
 impl ProfilesServer {
-    pub fn new(event_tx: mpsc::Sender<Event>, store: Arc<SymbolStore>) -> Self {
+    pub fn new(events: mpsc::Sender<Event>, store: Arc<SymbolStore>) -> Self {
         Self {
-            event_tx,
+            events,
             store,
-            known_basenames: Arc::new(RwLock::new(HashSet::new())),
+            known: Arc::default(),
         }
     }
-}
 
-/// Thin wrapper around `ProfilesDictionary` for ergonomic lookups.
-struct Dict<'a> {
-    d: &'a profiles::ProfilesDictionary,
-}
-
-impl<'a> Dict<'a> {
-    fn new(d: &'a profiles::ProfilesDictionary) -> Self {
-        Self { d }
+    /// Serve until the transport fails.
+    pub async fn serve(self, addr: SocketAddr) -> Result<(), tonic::transport::Error> {
+        tonic::transport::Server::builder()
+            .add_service(
+                collector::profiles_service_server::ProfilesServiceServer::new(self)
+                    .accept_compressed(CompressionEncoding::Gzip)
+                    .send_compressed(CompressionEncoding::Gzip),
+            )
+            .serve(addr)
+            .await
     }
 
-    fn str(&self, idx: i32) -> Option<&'a str> {
-        self.d
-            .string_table
-            .get(idx as usize)
-            .filter(|s| !s.is_empty())
-            .map(String::as_str)
-    }
-
-    fn func_name(&self, line: &profiles::Line) -> &'a str {
-        self.function(line)
-            .and_then(|f| self.str(f.name_strindex))
-            .unwrap_or("[unknown]")
-    }
-
-    fn func_file(&self, line: &profiles::Line) -> Option<&'a str> {
-        self.function(line)
-            .and_then(|f| self.str(f.filename_strindex))
-    }
-
-    fn function(&self, line: &profiles::Line) -> Option<&'a profiles::Function> {
-        self.d
-            .function_table
-            .get(line.function_index as usize)
-            .filter(|_| line.function_index > 0)
-    }
-
-    fn mapping_basename(&self, location: &profiles::Location) -> &'a str {
-        self.d
-            .mapping_table
-            .get(location.mapping_index as usize)
-            .filter(|_| location.mapping_index > 0)
-            .and_then(|m| self.str(m.filename_strindex))
-            .map(|full| full.rsplit('/').next().unwrap_or(full))
-            .unwrap_or("[unknown]")
-    }
-
-    fn runtime(&self, location: &profiles::Location) -> Runtime {
-        self.find_attr_value(&location.attribute_indices, "profile.frame.type")
-            .map_or(Runtime::Unknown, Runtime::from_otlp)
-    }
-
-    fn thread_name(&self, sample: &profiles::Sample) -> &'a str {
-        self.find_attr_value(&sample.attribute_indices, "thread.name")
-            .unwrap_or("[unknown]")
-    }
-
-    fn find_attr_value(&self, indices: &[i32], key: &str) -> Option<&'a str> {
-        indices.iter().find_map(|&idx| {
-            let attr = self
-                .d
-                .attribute_table
-                .get(idx as usize)
-                .filter(|_| idx > 0)?;
-            let k = self.str(attr.key_strindex)?;
-            if k != key {
-                return None;
-            }
-            match attr.value.as_ref()?.value.as_ref()? {
-                common::any_value::Value::StringValue(s) if !s.is_empty() => Some(s.as_str()),
-                _ => None,
-            }
-        })
-    }
-
-    fn unknown_basenames(&self, known: &RwLock<HashSet<String>>) -> Vec<String> {
-        self.d
-            .mapping_table
-            .iter()
-            .skip(1)
-            .filter_map(|mapping| {
-                let full_path = self.str(mapping.filename_strindex)?;
-                if known.read().ok()?.contains(full_path) {
-                    return None;
-                }
-                let basename = full_path.rsplit('/').next().unwrap_or(full_path);
-                if basename.is_empty() || basename.starts_with('[') {
-                    return None;
-                }
-                known.write().ok()?.insert(full_path.to_string());
-                Some(basename.to_string())
-            })
-            .collect()
-    }
-}
-
-/// Pre-resolves the location table into labeled, classified frames.
-///
-/// A location with several lines (or several symbolized inline levels) is an
-/// inline chain; it becomes one frame whose label joins the functions with
-/// ` / ` and whose kind is classified from the first function.
-fn pre_resolve_locations(dict: &Dict, store: &SymbolStore) -> Vec<Frame> {
-    dict.d
-        .location_table
-        .iter()
-        .map(|location| {
-            let runtime = dict.runtime(location);
-            let mapping = dict.mapping_basename(location);
-
-            let (names, file): (Vec<String>, Option<&str>) = if !location.lines.is_empty() {
-                let names = location
-                    .lines
-                    .iter()
-                    .map(|l| dict.func_name(l).to_owned())
-                    .collect();
-                (names, dict.func_file(&location.lines[0]))
-            } else if runtime == Runtime::Native
-                && let Some(names) = symbolize_native(store, location, dict)
-            {
-                (names, None)
-            } else {
-                (vec![format!("{mapping}+0x{:016x}", location.address)], None)
+    /// Decode on the blocking pool (symbol lookups hit disk) and publish.
+    fn publish(&self, request: collector::ExportProfilesServiceRequest) {
+        let (events, store, known) = (
+            self.events.clone(),
+            Arc::clone(&self.store),
+            Arc::clone(&self.known),
+        );
+        tokio::task::spawn_blocking(move || {
+            let Some(batch) = Decoder::decode(&request, &store, &known) else {
+                return;
             };
-
-            let info = FrameInfo {
-                function: &names[0],
-                file,
-                mapping: Some(mapping),
-            };
-            let kind = FrameKind {
-                runtime,
-                origin: classify(runtime, info),
-                inlined: names.len() > 1,
-            };
-            Frame {
-                name: names.join(" / "),
-                kind,
+            if !batch.new_mappings.is_empty() {
+                let _ = events.send(Event::MappingsDiscovered(batch.new_mappings));
             }
-        })
-        .collect()
-}
-
-fn process_export(
-    req: collector::ExportProfilesServiceRequest,
-    store: &SymbolStore,
-    known: &RwLock<HashSet<String>>,
-    event_tx: &mpsc::Sender<Event>,
-) {
-    let Some(raw_dict) = req.dictionary.as_ref() else {
-        return;
-    };
-    let dict = Dict::new(raw_dict);
-
-    let mut flamegraph = FlameGraph::new();
-    let mut stack_cache: HashMap<i32, Vec<Frame>> = HashMap::new();
-    let location_cache = pre_resolve_locations(&dict, store);
-    let mut sample_count: u64 = 0;
-    let mut thread_timestamps: HashMap<String, Vec<u64>> = HashMap::new();
-
-    let samples = req
-        .resource_profiles
-        .iter()
-        .flat_map(|rp| &rp.scope_profiles)
-        .flat_map(|sp| &sp.profiles)
-        .flat_map(|p| &p.samples);
-
-    for sample in samples {
-        let stack = stack_cache.entry(sample.stack_index).or_insert_with(|| {
-            let idx = sample.stack_index as usize;
-            if idx == 0 || idx >= dict.d.stack_table.len() {
-                return Vec::new();
-            }
-
-            let mut frames: Vec<Frame> = dict.d.stack_table[idx]
-                .location_indices
-                .iter()
-                .filter_map(|&loc_idx| location_cache.get(loc_idx as usize).cloned())
-                .collect();
-            frames.reverse();
-
-            let comm = Frame::thread(dict.thread_name(sample));
-            let mut result = Vec::with_capacity(frames.len() + 1);
-            result.push(comm);
-            result.extend(frames);
-            result
+            let _ = events.send(Event::ProfileUpdate {
+                flamegraph: batch.flamegraph,
+                samples: batch.samples,
+                timestamps: batch.timestamps,
+            });
         });
-
-        if stack.is_empty() {
-            continue;
-        }
-
-        let value = if !sample.timestamps_unix_nano.is_empty() {
-            thread_timestamps
-                .entry(stack[0].name.clone())
-                .or_default()
-                .extend_from_slice(&sample.timestamps_unix_nano);
-            sample.timestamps_unix_nano.len() as i64
-        } else if !sample.values.is_empty() {
-            sample.values.iter().sum::<i64>().max(1)
-        } else {
-            1
-        };
-
-        flamegraph.add_stack(stack, value);
-        sample_count += value as u64;
     }
-
-    let basenames = dict.unknown_basenames(known);
-    if !basenames.is_empty() {
-        let _ = event_tx.send(Event::MappingsDiscovered(basenames));
-    }
-    let _ = event_tx.send(Event::ProfileUpdate {
-        flamegraph,
-        samples: sample_count,
-        timestamps: thread_timestamps,
-    });
 }
 
 #[tonic::async_trait]
@@ -249,65 +68,21 @@ impl collector::profiles_service_server::ProfilesService for ProfilesServer {
         &self,
         request: Request<collector::ExportProfilesServiceRequest>,
     ) -> Result<Response<collector::ExportProfilesServiceResponse>, Status> {
-        tokio::task::spawn_blocking({
-            let store = self.store.clone();
-            let known_basenames = Arc::clone(&self.known_basenames);
-            let event_tx = self.event_tx.clone();
-            move || {
-                process_export(
-                    request.into_inner(),
-                    store.as_ref(),
-                    &known_basenames,
-                    &event_tx,
-                );
-            }
-        });
-
+        self.publish(request.into_inner());
         Ok(Response::new(collector::ExportProfilesServiceResponse {
             partial_success: None,
         }))
     }
 }
 
-fn symbolize_native(
-    store: &SymbolStore,
-    location: &profiles::Location,
-    dict: &Dict,
-) -> Option<Vec<String>> {
-    let resolved = store
-        .lookup(
-            store.file_id_for_basename(dict.mapping_basename(location))?,
-            location.address,
-        )
-        .ok()?;
-    if resolved.is_empty() {
-        return None;
-    }
-    Some(resolved.into_iter().map(|f| f.func).collect())
-}
-
-pub async fn start_server(
-    event_tx: mpsc::Sender<Event>,
-    addr: &str,
-    store: Arc<SymbolStore>,
-) -> Result<(), tonic::transport::Error> {
-    let addr = addr.parse().expect("invalid gRPC listen address");
-    let server = ProfilesServer::new(event_tx, store);
-
-    tonic::transport::Server::builder()
-        .add_service(
-            collector::profiles_service_server::ProfilesServiceServer::new(server)
-                .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
-                .send_compressed(tonic::codec::CompressionEncoding::Gzip),
-        )
-        .serve(addr)
-        .await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    use crate::frame::{FrameKind, Runtime};
+    use eprofiler_proto::opentelemetry::proto::common::v1 as common;
+    use eprofiler_proto::opentelemetry::proto::profiles::v1development as profiles;
 
     use collector::ExportProfilesServiceRequest;
     use collector::profiles_service_client::ProfilesServiceClient;
@@ -494,86 +269,5 @@ mod tests {
             }
             _ => panic!("expected ProfileUpdate event"),
         }
-    }
-
-    #[test]
-    fn locations_resolve_to_classified_frames() {
-        let attr = |key: i32, value: &str| KeyValueAndUnit {
-            key_strindex: key,
-            value: Some(AnyValue {
-                value: Some(any_value::Value::StringValue(value.into())),
-            }),
-            unit_strindex: 0,
-        };
-        let func = |name: i32| Function {
-            name_strindex: name,
-            ..Default::default()
-        };
-        let line = |function_index: i32| Line {
-            function_index,
-            ..Default::default()
-        };
-        let dict = ProfilesDictionary {
-            string_table: vec![
-                "".into(),
-                "profile.frame.type".into(),
-                "main.work".into(),
-                "runtime.mallocgc".into(),
-                "/usr/lib/x86_64-linux-gnu/libc.so.6".into(),
-            ],
-            attribute_table: vec![KeyValueAndUnit::default(), attr(1, "go"), attr(1, "native")],
-            function_table: vec![Function::default(), func(2), func(3)],
-            mapping_table: vec![
-                profiles::Mapping::default(),
-                profiles::Mapping {
-                    filename_strindex: 4,
-                    ..Default::default()
-                },
-            ],
-            location_table: vec![
-                Location::default(),
-                Location {
-                    lines: vec![line(1)],
-                    attribute_indices: vec![1],
-                    ..Default::default()
-                },
-                Location {
-                    lines: vec![line(2), line(1)],
-                    attribute_indices: vec![1],
-                    ..Default::default()
-                },
-                Location {
-                    mapping_index: 1,
-                    address: 0x1234,
-                    attribute_indices: vec![2],
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-        let tmp = tempfile::tempdir().unwrap();
-        let store = SymbolStore::open(tmp.path()).unwrap();
-
-        let frames = pre_resolve_locations(&Dict::new(&dict), &store);
-        let kinds: Vec<_> = frames[1..]
-            .iter()
-            .map(|f| {
-                (
-                    f.name.as_str(),
-                    f.kind.runtime,
-                    f.kind.origin,
-                    f.kind.inlined,
-                )
-            })
-            .collect();
-        use crate::frame::Origin::{Application as App, Runtime as Rt};
-        assert_eq!(
-            kinds,
-            vec![
-                ("main.work", Runtime::Go, App, false),
-                ("runtime.mallocgc / main.work", Runtime::Go, Rt, true),
-                ("libc.so.6+0x0000000000001234", Runtime::Native, Rt, false),
-            ]
-        );
     }
 }

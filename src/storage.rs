@@ -33,14 +33,6 @@ impl RangeKey {
             depth: U16::new(depth),
         }
     }
-
-    fn va_start(&self) -> u64 {
-        self.va_start.get()
-    }
-
-    fn depth(&self) -> u16 {
-        self.depth.get()
-    }
 }
 
 /// Fixed-size value stored alongside each [`RangeKey`].
@@ -66,14 +58,6 @@ impl RangeValue {
             call_file_ref: U32::new(r.call_file.map_or(NONE_REF, |s| s.0)),
             call_line: U32::new(r.call_line.unwrap_or(0)),
         }
-    }
-
-    fn length(&self) -> u32 {
-        self.length.get()
-    }
-
-    fn func_ref(&self) -> u32 {
-        self.func_ref.get()
     }
 }
 
@@ -106,6 +90,26 @@ pub struct ExecutableInfo {
     pub file_id: FileId,
     pub file_name: String,
     pub num_ranges: u32,
+}
+
+impl ExecutableInfo {
+    /// Value in the `files` partition: big-endian range count, then the file name.
+    fn encode_value(&self) -> Vec<u8> {
+        let mut value = self.num_ranges.to_be_bytes().to_vec();
+        value.extend_from_slice(self.file_name.as_bytes());
+        value
+    }
+
+    /// Inverse of [`Self::encode_value`], with the file ID taken from the key.
+    fn decode(key: &[u8], value: &[u8]) -> Option<Self> {
+        let file_id = U128::<BigEndian>::ref_from_bytes(key).ok()?.get();
+        let (count, name) = value.split_first_chunk::<4>()?;
+        Some(Self {
+            file_id: FileId::from(file_id),
+            file_name: String::from_utf8_lossy(name).into_owned(),
+            num_ranges: u32::from_be_bytes(*count),
+        })
+    }
 }
 
 /// Persistent symbol store backed by fjall (LSM-tree).
@@ -146,12 +150,11 @@ impl SymbolStore {
 
         // Rebuild in-memory basename index from persisted metadata.
         for info in store.list_files()? {
-            let basename = basename_of(&info.file_name);
             store
                 .basename_index
                 .write()
                 .unwrap()
-                .insert(basename, info.file_id);
+                .insert(info.file_name, info.file_id);
         }
 
         Ok(store)
@@ -178,23 +181,25 @@ impl SymbolStore {
             );
         }
 
-        let file_name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let num_ranges = file_sym.ranges.len() as u32;
-        let mut meta_val = num_ranges.to_be_bytes().to_vec();
-        meta_val.extend_from_slice(file_name.as_bytes());
-        let fid_key = U128::<BigEndian>::new(fid);
-        batch.insert(&self.files, fid_key.as_bytes(), &meta_val);
-
+        let info = ExecutableInfo {
+            file_id: file_sym.file_id,
+            file_name: path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            num_ranges: file_sym.ranges.len() as u32,
+        };
+        batch.insert(
+            &self.files,
+            U128::<BigEndian>::new(fid).as_bytes(),
+            info.encode_value(),
+        );
         batch.commit()?;
 
-        let bname = basename_of(&file_name);
         self.basename_index
             .write()
             .unwrap()
-            .insert(bname, file_sym.file_id);
+            .insert(info.file_name, info.file_id);
 
         Ok(())
     }
@@ -220,16 +225,16 @@ impl SymbolStore {
                 continue;
             };
 
-            let start = key.va_start();
-            let end = start.saturating_add(val.length() as u64);
+            let start = key.va_start.get();
+            let end = start.saturating_add(val.length.get() as u64);
 
             if addr >= start && addr < end {
                 frames.push(ResolvedFrame {
-                    func: self.resolve_string(fid, val.func_ref())?,
-                    depth: key.depth(),
+                    func: self.resolve_string(fid, val.func_ref.get())?,
+                    depth: key.depth.get(),
                 });
             }
-            if key.depth() == 0 {
+            if key.depth.get() == 0 {
                 break;
             }
         }
@@ -259,7 +264,7 @@ impl SymbolStore {
         let mut result = Vec::new();
         for guard in self.files.range::<Vec<u8>, _>(..) {
             let (kb, vb) = guard.into_inner()?;
-            if let Some(info) = parse_file_meta(&kb, &vb) {
+            if let Some(info) = ExecutableInfo::decode(&kb, &vb) {
                 result.push(info);
             }
         }
@@ -292,20 +297,92 @@ impl SymbolStore {
     }
 }
 
-fn parse_file_meta(kb: &[u8], vb: &[u8]) -> Option<ExecutableInfo> {
-    let fid_key = U128::<BigEndian>::ref_from_bytes(kb).ok()?;
-    if vb.len() < 4 {
-        return None;
-    }
-    let num_ranges = u32::from_be_bytes(vb[..4].try_into().ok()?);
-    let file_name = String::from_utf8_lossy(&vb[4..]).into_owned();
-    Some(ExecutableInfo {
-        file_id: FileId::from(fid_key.get()),
-        file_name,
-        num_ranges,
-    })
-}
+#[cfg(test)]
+mod tests {
+    use indexmap::IndexSet;
 
-fn basename_of(path: &str) -> String {
-    path.rsplit('/').next().unwrap_or(path).to_owned()
+    use super::*;
+    use crate::symbolizer::{StringRef, SymRange};
+
+    fn symbols(file_id: u128) -> FileSym {
+        let range = |va_start, length, func, depth| SymRange {
+            va_start,
+            length,
+            func: StringRef(func),
+            file: None,
+            call_file: None,
+            call_line: None,
+            depth,
+        };
+        FileSym {
+            file_id: FileId::from(file_id),
+            // `outer` spans 0x1000..0x1100; `inner` is inlined at 0x1010..0x1020.
+            ranges: vec![range(0x1000, 0x100, 0, 0), range(0x1010, 0x10, 1, 1)],
+            strings: IndexSet::from(["outer".to_string(), "inner".to_string()]),
+        }
+    }
+
+    #[test]
+    fn metadata_round_trips_through_the_files_partition() {
+        let info = ExecutableInfo {
+            file_id: FileId::from(42u128),
+            file_name: "app".into(),
+            num_ranges: 7,
+        };
+        let key = U128::<BigEndian>::new(42);
+        let decoded = ExecutableInfo::decode(key.as_bytes(), &info.encode_value()).unwrap();
+        assert_eq!(
+            (decoded.file_id, decoded.file_name, decoded.num_ranges),
+            (info.file_id, info.file_name, info.num_ranges)
+        );
+        assert!(ExecutableInfo::decode(key.as_bytes(), &[0, 1]).is_none());
+    }
+
+    #[test]
+    fn store_lookup_and_remove() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SymbolStore::open(tmp.path()).unwrap();
+        store
+            .store_file_symbols(&symbols(7), Path::new("/usr/bin/app"))
+            .unwrap();
+
+        let files = store.list_files().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            (files[0].file_name.as_str(), files[0].num_ranges),
+            ("app", 2)
+        );
+        let id = store.file_id_for_basename("app").unwrap();
+
+        let funcs = |addr| -> Vec<String> {
+            store
+                .lookup(id, addr)
+                .unwrap()
+                .into_iter()
+                .map(|f| f.func)
+                .collect()
+        };
+        assert_eq!(funcs(0x1004), ["outer"]);
+        assert_eq!(funcs(0x1014), ["outer", "inner"]);
+        assert!(funcs(0x2000).is_empty());
+
+        store.remove_file_symbols(id).unwrap();
+        assert!(store.list_files().unwrap().is_empty());
+        assert!(store.file_id_for_basename("app").is_none());
+    }
+
+    #[test]
+    fn reopening_restores_the_basename_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = Path::new("/opt/svc");
+        SymbolStore::open(tmp.path())
+            .unwrap()
+            .store_file_symbols(&symbols(9), path)
+            .unwrap();
+        let reopened = SymbolStore::open(tmp.path()).unwrap();
+        assert_eq!(
+            reopened.file_id_for_basename("svc"),
+            Some(FileId::from(9u128))
+        );
+    }
 }

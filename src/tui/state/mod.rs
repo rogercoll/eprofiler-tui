@@ -2,7 +2,7 @@ mod executables;
 mod flamegraph;
 mod flamescope;
 
-pub use executables::ExecutablesTab;
+pub use executables::{ExeEntry, ExecutablesTab};
 pub use flamegraph::FlamegraphTab;
 pub use flamescope::FlamescopeTab;
 

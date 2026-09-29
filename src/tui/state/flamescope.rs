@@ -1,23 +1,25 @@
 use std::collections::HashMap;
+use std::ops::Range;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
 use super::flamegraph::THREAD_PICKER;
 use crate::tui::widgets::{Cursor, Picker, PickerEvent};
 
-const SUBSECOND_ROWS: usize = 10;
+/// Samples are bucketed at 10ms. Display rows group whole buckets, so this
+/// is also the finest resolution a tall terminal can show.
+const BUCKETS: usize = 100;
 const NS_PER_SEC: u64 = 1_000_000_000;
-const NS_PER_ROW: u64 = NS_PER_SEC / SUBSECOND_ROWS as u64;
+const NS_PER_BUCKET: u64 = NS_PER_SEC / BUCKETS as u64;
+const MS_PER_BUCKET: usize = 1000 / BUCKETS;
 
-/// Number of one-second columns visible at once.
-pub const VISIBLE_COLS: usize = 30;
-
-pub type Column = [u64; SUBSECOND_ROWS];
+/// One second of samples, one counter per 10ms bucket.
+pub type Column = [u32; BUCKETS];
 
 pub struct FlamescopeTab {
     epoch_ns: Option<u64>,
-    columns: Vec<Column>,
-    threads: HashMap<String, Vec<Column>>,
+    all: Timeline,
+    threads: HashMap<String, Timeline>,
     thread_names: Vec<String>,
     pub filter: Option<String>,
     pub picker: Option<Picker>,
@@ -25,15 +27,17 @@ pub struct FlamescopeTab {
     pub auto_scroll: bool,
     /// Selected second (`index`) and first visible second (`offset`).
     pub col: Cursor,
-    /// Selected subsecond row.
+    /// Selected display row, in `0..rows`.
     pub row: usize,
+    /// Display rows per second, chosen by the view to fill the terminal height.
+    rows: usize,
 }
 
 impl Default for FlamescopeTab {
     fn default() -> Self {
         Self {
             epoch_ns: None,
-            columns: Vec::new(),
+            all: Timeline::default(),
             threads: HashMap::new(),
             thread_names: Vec::new(),
             filter: None,
@@ -41,12 +45,45 @@ impl Default for FlamescopeTab {
             auto_scroll: true,
             col: Cursor::default(),
             row: 0,
+            rows: 10,
         }
     }
 }
 
 impl FlamescopeTab {
-    pub const ROWS: usize = SUBSECOND_ROWS;
+    /// Most display rows per second: one per bucket.
+    pub const MAX_ROWS: usize = BUCKETS;
+
+    /// Switch display resolution, keeping the cursor at the same time offset.
+    pub fn set_rows(&mut self, rows: usize) {
+        let rows = rows.clamp(1, Self::MAX_ROWS);
+        if rows != self.rows {
+            self.row = (self.row * rows / self.rows).min(rows - 1);
+            self.rows = rows;
+        }
+    }
+
+    /// Buckets covered by display row `row`. When `rows` does not divide
+    /// [`BUCKETS`], spans differ by at most one bucket.
+    fn row_buckets(&self, row: usize) -> Range<usize> {
+        row * BUCKETS / self.rows..(row + 1) * BUCKETS / self.rows
+    }
+
+    /// Start of display row `row` within its second, in milliseconds.
+    pub fn row_start_ms(&self, row: usize) -> usize {
+        self.row_buckets(row).start * MS_PER_BUCKET
+    }
+
+    /// Samples in display row `row` of `col`.
+    pub fn cell(&self, col: &Column, row: usize) -> u64 {
+        col[self.row_buckets(row)].iter().map(|&n| n as u64).sum()
+    }
+
+    /// Samples per bucket in display row `row` of `col`. Colors use this so
+    /// rows spanning one bucket more than their neighbors do not look hotter.
+    pub fn density(&self, col: &Column, row: usize) -> f64 {
+        self.cell(col, row) as f64 / self.row_buckets(row).len() as f64
+    }
 
     pub fn record_timestamps(&mut self, entries: &HashMap<String, Vec<u64>>) {
         for (thread, timestamps) in entries {
@@ -63,62 +100,76 @@ impl FlamescopeTab {
                 let epoch = *self.epoch_ns.get_or_insert(ts);
                 let offset = ts.saturating_sub(epoch);
                 let col = (offset / NS_PER_SEC) as usize;
-                let row =
-                    ((offset % NS_PER_SEC) / NS_PER_ROW).min(SUBSECOND_ROWS as u64 - 1) as usize;
+                let bucket = ((offset % NS_PER_SEC) / NS_PER_BUCKET) as usize;
 
-                bump(&mut self.columns, col, row);
-                bump(thread_cols, col, row);
+                self.all.record(col, bucket);
+                thread_cols.record(col, bucket);
             }
         }
         self.sync_cursor();
     }
 
     pub fn is_empty(&self) -> bool {
-        self.columns.is_empty()
+        self.all.0.is_empty()
     }
 
     pub fn visible_columns(&self) -> &[Column] {
         match &self.filter {
-            Some(name) => self.threads.get(name).map_or(&[], Vec::as_slice),
-            None => &self.columns,
+            Some(name) => self.threads.get(name).map_or(&[], |t| &t.0),
+            None => &self.all.0,
         }
     }
 
     pub fn selected_value(&self) -> u64 {
         self.visible_columns()
             .get(self.col.index)
-            .map_or(0, |col| col[self.row])
+            .map_or(0, |col| self.cell(col, self.row))
     }
 
     /// `(second, ms_start, ms_end)` of the selected cell.
     pub fn selected_time(&self) -> (usize, usize, usize) {
-        let ms_start = (self.row * 1000) / SUBSECOND_ROWS;
-        let ms_end = ((self.row + 1) * 1000) / SUBSECOND_ROWS;
-        (self.col.index, ms_start, ms_end)
+        let buckets = self.row_buckets(self.row);
+        (
+            self.col.index,
+            buckets.start * MS_PER_BUCKET,
+            buckets.end * MS_PER_BUCKET,
+        )
     }
 
+    /// Most samples in any visible display cell.
     pub fn visible_peak(&self) -> u64 {
-        self.visible_columns()
-            .iter()
-            .flatten()
-            .copied()
+        self.cells()
+            .map(|(col, row)| self.cell(col, row))
             .max()
             .unwrap_or(0)
+    }
+
+    /// Highest per-bucket density of any visible display cell; the heatmap's scale.
+    pub fn peak_density(&self) -> f64 {
+        self.cells()
+            .map(|(col, row)| self.density(col, row))
+            .fold(0.0, f64::max)
+    }
+
+    fn cells(&self) -> impl Iterator<Item = (&Column, usize)> {
+        self.visible_columns()
+            .iter()
+            .flat_map(move |col| (0..self.rows).map(move |row| (col, row)))
     }
 
     pub fn total_seconds(&self) -> usize {
         self.visible_columns().len()
     }
 
-    /// Clamp the column cursor to the data, snap to the newest column when
-    /// auto-scrolling, and keep it inside the fixed-width viewport.
+    /// Clamp the column cursor to the data and snap it to the newest column
+    /// when auto-scrolling. The view scrolls it into its viewport, whose
+    /// width depends on the terminal.
     fn sync_cursor(&mut self) {
         let len = self.visible_columns().len();
         self.col.clamp(len);
         if self.auto_scroll {
             self.col.last(len);
         }
-        self.col.scroll_to_fit(VISIBLE_COLS);
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) {
@@ -135,7 +186,7 @@ impl FlamescopeTab {
                 self.col.prev();
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.row + 1 < SUBSECOND_ROWS {
+                if self.row + 1 < self.rows {
                     self.row += 1;
                 }
             }
@@ -182,12 +233,19 @@ impl FlamescopeTab {
     }
 }
 
-/// Increment `cols[col][row]`, growing `cols` with empty columns as needed.
-fn bump(cols: &mut Vec<Column>, col: usize, row: usize) {
-    if cols.len() <= col {
-        cols.resize(col + 1, [0; SUBSECOND_ROWS]);
+/// One-second columns of bucketed sample counts, indexed by seconds since
+/// the first sample.
+#[derive(Default)]
+struct Timeline(Vec<Column>);
+
+impl Timeline {
+    /// Count one sample, growing the timeline with empty seconds as needed.
+    fn record(&mut self, second: usize, bucket: usize) {
+        if self.0.len() <= second {
+            self.0.resize(second + 1, [0; BUCKETS]);
+        }
+        self.0[second][bucket] += 1;
     }
-    cols[col][row] += 1;
 }
 
 #[cfg(test)]
@@ -201,20 +259,64 @@ mod tests {
     }
 
     #[test]
-    fn timestamps_bucket_into_seconds_and_rows() {
-        let tab = tab_with(&[0, 150_000_000, NS_PER_SEC * 2 + 950_000_000]);
+    fn timestamps_bucket_into_seconds_and_10ms_buckets() {
+        let tab = tab_with(&[0, 150_000_000, NS_PER_SEC * 2 + 995_000_000]);
         let cols = tab.visible_columns();
         assert_eq!(cols.len(), 3);
         assert_eq!(cols[0][0], 1);
-        assert_eq!(cols[0][1], 1);
-        assert_eq!(cols[2][9], 1);
+        assert_eq!(cols[0][15], 1, "150ms lands in the 150-160ms bucket");
+        assert_eq!(cols[2][99], 1, "995ms lands in the last bucket");
+    }
+
+    #[test]
+    fn uneven_rows_are_colored_by_density() {
+        // 3 rows over 100 buckets span 33, 33 and 34 buckets.
+        let mut tab = tab_with(&[0]);
+        tab.set_rows(3);
+        assert_eq!(tab.row_buckets(0), 0..33);
+        assert_eq!(tab.row_buckets(2), 66..100);
+        assert_eq!(tab.row_start_ms(2), 660);
+        // One sample in every bucket: equal density everywhere, despite the
+        // last row holding one more sample.
+        let ts: Vec<u64> = (0..100).map(|b| b * NS_PER_BUCKET).collect();
+        let mut tab = tab_with(&ts);
+        tab.set_rows(3);
+        let col = tab.visible_columns()[0];
+        assert_eq!((tab.cell(&col, 0), tab.cell(&col, 2)), (33, 34));
+        assert_eq!(tab.density(&col, 0), tab.density(&col, 2));
+        assert_eq!(tab.peak_density(), 1.0);
+    }
+
+    #[test]
+    fn display_rows_sum_whole_buckets() {
+        // Three samples in the first 100ms, one at 500ms.
+        let mut tab = tab_with(&[0, 30_000_000, 90_000_000, 500_000_000]);
+        tab.set_rows(10);
+        let col = tab.visible_columns()[0];
+        assert_eq!(tab.cell(&col, 0), 3);
+        assert_eq!(tab.cell(&col, 5), 1);
+        assert_eq!(tab.visible_peak(), 3);
+        tab.set_rows(50);
+        assert_eq!(tab.visible_peak(), 1, "finer rows split the burst");
+    }
+
+    #[test]
+    fn changing_resolution_keeps_the_cursor_time() {
+        let mut tab = tab_with(&[0]);
+        tab.set_rows(10);
+        tab.row = 5;
+        assert_eq!(tab.selected_time(), (0, 500, 600));
+        tab.set_rows(50);
+        assert_eq!(tab.row, 25);
+        assert_eq!(tab.selected_time(), (0, 500, 520));
+        tab.set_rows(5);
+        assert_eq!(tab.selected_time(), (0, 400, 600));
     }
 
     #[test]
     fn auto_scroll_follows_newest_column() {
         let tab = tab_with(&[0, NS_PER_SEC * 40]);
         assert_eq!(tab.col.index, 40);
-        assert_eq!(tab.col.offset, 40 + 1 - VISIBLE_COLS);
     }
 
     #[test]
