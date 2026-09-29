@@ -1,11 +1,11 @@
 //! OTLP profiles gRPC receiver: accepts export requests and forwards the
 //! decoded data to the UI as events.
 
-use std::net::SocketAddr;
 use std::sync::{Arc, mpsc};
 
 use eprofiler_proto::opentelemetry::proto::collector::profiles::v1development as collector;
 use tonic::codec::CompressionEncoding;
+use tonic::transport::server::TcpIncoming;
 use tonic::{Request, Response, Status};
 
 use crate::otlp::{Decoder, KnownMappings};
@@ -27,15 +27,15 @@ impl ProfilesServer {
         }
     }
 
-    /// Serve until the transport fails.
-    pub async fn serve(self, addr: SocketAddr) -> Result<(), tonic::transport::Error> {
+    /// Serve connections from `incoming` until the transport fails.
+    pub async fn serve(self, incoming: TcpIncoming) -> Result<(), tonic::transport::Error> {
         tonic::transport::Server::builder()
             .add_service(
                 collector::profiles_service_server::ProfilesServiceServer::new(self)
                     .accept_compressed(CompressionEncoding::Gzip)
                     .send_compressed(CompressionEncoding::Gzip),
             )
-            .serve(addr)
+            .serve_with_incoming(incoming)
             .await
     }
 

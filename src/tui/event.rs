@@ -30,6 +30,8 @@ pub enum Event {
         name: String,
         error: Option<crate::error::Error>,
     },
+    /// The OTLP receiver stopped after starting.
+    ServerFailed(crate::error::Error),
 }
 
 /// Merges terminal input and a periodic tick into one channel that other

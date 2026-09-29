@@ -83,7 +83,9 @@ fn main() -> Result<()> {
     let store = Arc::new(SymbolStore::open(cli.storage_path()?)?);
     let events = EventHandler::new(TICK_RATE_MS);
     let services = Services::new(Arc::clone(&store), events.sender.clone());
-    services.serve(addr);
+    let mut state = State::new(addr.to_string(), store.list_files()?);
+    // Keep running on failure: the landing page shows why nothing arrives.
+    state.server_error = services.serve(addr).err();
 
     let mut tui = Tui::new(
         Terminal::new(CrosstermBackend::new(std::io::stderr()))?,
@@ -91,7 +93,6 @@ fn main() -> Result<()> {
     );
     tui.init()?;
 
-    let mut state = State::new(addr.to_string(), store.list_files()?);
     while state.running {
         tui.draw(&mut state)?;
         if let Some(action) = state.handle_event(tui.events.next()?) {

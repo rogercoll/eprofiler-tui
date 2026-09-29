@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::error::Error;
 use crate::storage::{ExecutableInfo, FileId};
 use crate::tui::event::Event;
 use crate::tui::widgets::Picker;
@@ -40,6 +41,8 @@ pub enum Action {
 pub struct State {
     pub running: bool,
     pub listen_addr: String,
+    /// Why the OTLP receiver is not running, if it is not.
+    pub server_error: Option<Error>,
     pub active_tab: ActiveTab,
     pub fg: FlamegraphTab,
     pub fs: FlamescopeTab,
@@ -51,6 +54,7 @@ impl State {
         Self {
             running: true,
             listen_addr,
+            server_error: None,
             active_tab: ActiveTab::Flamegraph,
             fg: FlamegraphTab::default(),
             fs: FlamescopeTab::default(),
@@ -93,6 +97,10 @@ impl State {
             }
             Event::SymbolsRemoved { name, error } => {
                 self.exe.handle_symbols_removed(name, error);
+                None
+            }
+            Event::ServerFailed(error) => {
+                self.server_error = Some(error);
                 None
             }
         }
@@ -216,5 +224,19 @@ mod tests {
         state.handle_event(key(KeyCode::Char('/')));
         assert!(state.handle_event(key(KeyCode::Enter)).is_none());
         assert!(state.exe.picker().is_none());
+    }
+
+    #[test]
+    fn server_failure_is_kept_for_the_landing_page() {
+        let mut state = State::new("addr".into(), vec![]);
+        let source = std::io::Error::from(std::io::ErrorKind::AddrInUse);
+        let addr = "0.0.0.0:4317".parse().unwrap();
+        assert!(
+            state
+                .handle_event(Event::ServerFailed(Error::Bind { addr, source }))
+                .is_none()
+        );
+        assert!(matches!(state.server_error, Some(Error::Bind { .. })));
+        assert!(state.running, "the UI keeps running");
     }
 }

@@ -7,11 +7,15 @@ use ratatui::{
     widgets::Widget,
 };
 
+use crate::error::Error;
 use crate::tui::canvas::BufferExt;
 use crate::tui::theme;
 
-/// Logo, listen address and a waiting message. Holds the listen address.
-pub struct Waiting<'a>(pub &'a str);
+/// Logo, listen address and either a waiting message or why the server is down.
+pub struct Waiting<'a> {
+    pub listen_addr: &'a str,
+    pub error: Option<&'a Error>,
+}
 
 impl Waiting<'_> {
     const LOGO: [&'static str; 6] = [
@@ -68,9 +72,15 @@ impl Widget for Waiting<'_> {
         let rule_x = area.x + area.width.saturating_sub(rule_w) / 2;
         let rule = Style::new().fg(theme::RULE);
         buf.hline(y + 1, rule_x, rule_x + rule_w, '─', rule);
-        let address = format!("Listening on {}", self.0);
-        buf.center(area, y + 2, &address, Style::new().fg(theme::MUTED));
-        let waiting = Style::new().fg(theme::DIM).italic();
-        buf.center(area, y + 3, "Waiting for profiles...", waiting);
+        let (status, status_color, note) = match self.error {
+            None => (
+                format!("Listening on {}", self.listen_addr),
+                theme::MUTED,
+                "Waiting for profiles...",
+            ),
+            Some(error) => (error.to_string(), theme::ERROR, "Not receiving profiles"),
+        };
+        buf.center(area, y + 2, &status, Style::new().fg(status_color));
+        buf.center(area, y + 3, note, Style::new().fg(theme::DIM).italic());
     }
 }

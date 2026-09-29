@@ -31,7 +31,11 @@ impl StatefulWidget for Screen {
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut State) {
         if state.active_tab == ActiveTab::Flamegraph && state.fg.graph.root.total_value == 0 {
-            Waiting(&state.listen_addr).render(area, buf);
+            Waiting {
+                listen_addr: &state.listen_addr,
+                error: state.server_error.as_ref(),
+            }
+            .render(area, buf);
             return;
         }
 
@@ -142,6 +146,7 @@ mod tests {
     use ratatui::style::Color;
 
     use super::testing::{key, populated_state, render, screen};
+    use crate::error::Error;
     use crate::tui::state::State;
 
     #[test]
@@ -151,6 +156,23 @@ mod tests {
         // Like the tabs, the landing page keeps the terminal background.
         let buf = render(&mut state, 120, 30);
         assert!(buf.content.iter().all(|cell| cell.bg == Color::Reset));
+    }
+
+    #[test]
+    fn landing_page_explains_why_the_server_is_down() {
+        let mut state = State::new("0.0.0.0:4317".into(), vec![]);
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = taken.local_addr().unwrap();
+        let source = std::net::TcpListener::bind(addr).unwrap_err();
+        state.server_error = Some(Error::Bind { addr, source });
+
+        let shown = screen(&mut state, 120, 30);
+        assert!(
+            shown.contains(&format!("cannot listen on {addr}")),
+            "{shown}"
+        );
+        assert!(shown.contains("Not receiving profiles"), "{shown}");
+        assert!(!shown.contains("Waiting for profiles"), "{shown}");
     }
 
     #[test]

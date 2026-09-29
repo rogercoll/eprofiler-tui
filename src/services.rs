@@ -6,6 +6,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::thread;
 
+use tonic::transport::server::TcpIncoming;
+
+use crate::error::{Error, Result};
 use crate::grpc::ProfilesServer;
 use crate::storage::{ExecutableInfo, FileId, SymbolStore};
 use crate::symbolizer::FileSym;
@@ -22,15 +25,24 @@ impl Services {
         Self { store, events }
     }
 
-    /// Run the OTLP receiver on its own thread and Tokio runtime.
-    pub fn serve(&self, addr: SocketAddr) {
+    /// Bind `addr` and run the OTLP receiver on its own thread and Tokio
+    /// runtime. Binding happens here, so a busy port or missing permission is
+    /// returned; a failure after that arrives as [`Event::ServerFailed`].
+    pub fn serve(&self, addr: SocketAddr) -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new()?;
+        // The listener registers with the runtime's reactor, so bind inside it.
+        let incoming = {
+            let _guard = runtime.enter();
+            TcpIncoming::bind(addr).map_err(|source| Error::Bind { addr, source })?
+        };
         let server = ProfilesServer::new(self.events.clone(), Arc::clone(&self.store));
+        let events = self.events.clone();
         thread::spawn(move || {
-            let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-            if let Err(e) = runtime.block_on(server.serve(addr)) {
-                eprintln!("gRPC server error: {e}");
+            if let Err(e) = runtime.block_on(server.serve(incoming)) {
+                let _ = events.send(Event::ServerFailed(e.into()));
             }
         });
+        Ok(())
     }
 
     pub fn run(&self, action: Action) {
@@ -70,5 +82,37 @@ impl Services {
             let error = store.remove_file_symbols(file_id).err();
             let _ = events.send(Event::SymbolsRemoved { name, error });
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn services() -> (Services, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(SymbolStore::open(tmp.path()).unwrap());
+        (Services::new(store, mpsc::channel().0), tmp)
+    }
+
+    #[test]
+    fn serving_on_a_busy_port_reports_the_address() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = taken.local_addr().unwrap();
+        let (services, _tmp) = services();
+
+        let error = services.serve(addr).unwrap_err();
+        assert!(matches!(error, Error::Bind { addr: a, .. } if a == addr));
+        assert!(
+            error
+                .to_string()
+                .starts_with(&format!("cannot listen on {addr}: "))
+        );
+    }
+
+    #[test]
+    fn serving_on_a_free_port_succeeds() {
+        let (services, _tmp) = services();
+        assert!(services.serve("127.0.0.1:0".parse().unwrap()).is_ok());
     }
 }
