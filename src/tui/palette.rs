@@ -18,19 +18,25 @@ use crate::frame::{FrameKind, Origin, Runtime};
 const LIGHT_INLINED: f64 = 0.07;
 const LIGHT_JITTER: f64 = 0.025;
 
-/// Hue, saturation and lightness range for one runtime's frames.
+/// Saturation and lightness range for one group of frames.
+#[derive(Clone, Copy)]
+struct Tone {
+    sat: f64,
+    /// Lightness of a frame with no self time.
+    light_min: f64,
+    /// Extra lightness for a frame that is all self time.
+    light_range: f64,
+}
+
+/// How one runtime's frames are colored.
 #[derive(Clone, Copy)]
 struct Band {
     /// Hue center in degrees.
     center: f64,
     /// Per-name hue offset, up to this many degrees either way.
     spread: f64,
-    sat_application: f64,
-    sat_runtime: f64,
-    /// Lightness of a frame with no self time.
-    light_min: f64,
-    /// Extra lightness for a frame that is all self time.
-    light_range: f64,
+    application: Tone,
+    runtime: Tone,
 }
 
 impl Band {
@@ -38,25 +44,38 @@ impl Band {
         Self {
             center,
             spread: 7.0,
-            sat_application: 0.85,
-            sat_runtime: 0.28,
-            light_min: 0.42,
-            light_range: 0.24,
+            application: Tone {
+                sat: 0.85,
+                light_min: 0.42,
+                light_range: 0.24,
+            },
+            runtime: Tone {
+                sat: 0.28,
+                light_min: 0.42,
+                light_range: 0.24,
+            },
         }
     }
 }
 
 /// Brendan Gregg's "hot" scheme: each name lands somewhere between red and
-/// yellow. Kept at full saturation and high lightness, since dim orange and
-/// yellow read as brown. Runtime frames are nearly grey, so the vivid hot
-/// colors are reserved for application code.
+/// yellow, at full saturation, since dim orange and yellow read as brown.
+/// Runtime frames use pastel tints of the same hues (peach, cream, salmon):
+/// mixing toward white rather than grey keeps them pleasant while vivid
+/// color stays reserved for application code.
 const NATIVE: Band = Band {
     center: 27.0,
     spread: 25.0,
-    sat_application: 1.0,
-    sat_runtime: 0.10,
-    light_min: 0.50,
-    light_range: 0.16,
+    application: Tone {
+        sat: 1.0,
+        light_min: 0.50,
+        light_range: 0.16,
+    },
+    runtime: Tone {
+        sat: 0.80,
+        light_min: 0.76,
+        light_range: 0.08,
+    },
 };
 
 /// The band for a runtime, or `None` for grey (non-code rows and unknown frames).
@@ -100,19 +119,18 @@ pub fn swatch(runtime: Runtime, origin: Origin) -> Color {
 
 /// `hue_jitter` is in -1.0..=1.0 and is scaled by the band's spread.
 fn shade(kind: FrameKind, self_ratio: f64, hue_jitter: f64, light_offset: f64) -> Color {
+    let band = band(kind.runtime);
     // Grey rows use the default lightness so they sit with the other frames.
-    let b = band(kind.runtime).unwrap_or(Band::around(0.0));
+    let b = band.unwrap_or(Band::around(0.0));
+    let muted = kind.origin == Origin::Runtime && kind.runtime != Runtime::Kernel;
+    let tone = if muted { b.runtime } else { b.application };
+
     let heat = self_ratio.clamp(0.0, 1.0).sqrt();
-    let mut light = b.light_min + b.light_range * heat + light_offset;
+    let mut light = tone.light_min + tone.light_range * heat + light_offset;
     if kind.inlined {
         light += LIGHT_INLINED;
     }
-    let muted = kind.origin == Origin::Runtime && kind.runtime != Runtime::Kernel;
-    let sat = match band(kind.runtime) {
-        None => 0.0,
-        Some(_) if muted => b.sat_runtime,
-        Some(_) => b.sat_application,
-    };
+    let sat = if band.is_some() { tone.sat } else { 0.0 };
     hsl(b.center + hue_jitter * b.spread, sat, light.clamp(0.0, 1.0))
 }
 
@@ -237,19 +255,24 @@ mod tests {
     }
 
     #[test]
-    fn native_application_is_never_brown_and_runtime_is_near_grey() {
+    fn native_colors_are_never_brown_and_runtime_is_pastel() {
         let app = kind(Runtime::Native, Origin::Application);
         let rt = kind(Runtime::Native, Origin::Runtime);
         for i in 0..200 {
             let name = format!("fn_{i}");
-            // Brown is a warm hue with a dim top channel; hot colors keep red at full strength.
-            let (r, _, _) = rgb(frame_color(app, &name, 0.0));
-            assert!(r >= 240, "{name}: red channel {r} reads as brown");
-            let muted = frame_color(rt, &name, 0.0);
+            let vivid = frame_color(app, &name, 0.0);
+            let pastel = frame_color(rt, &name, 0.0);
+            // Brown is a warm hue with a dim top channel; both tones keep red high.
+            for c in [vivid, pastel] {
+                assert!(rgb(c).0 >= 230, "{name}: {c:?} reads as brown");
+            }
+            // Pastel: lighter and softer than the vivid tone, yet clearly colored.
+            assert!(luma(pastel) > luma(vivid), "{name}: {pastel:?} not lighter");
             assert!(
-                chroma(muted) < 40,
-                "{name}: runtime {muted:?} is not near grey"
+                chroma(pastel) < chroma(vivid),
+                "{name}: {pastel:?} not softer"
             );
+            assert!(chroma(pastel) > 50, "{name}: {pastel:?} is greyish");
         }
     }
 }
