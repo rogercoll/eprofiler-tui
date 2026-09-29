@@ -7,14 +7,15 @@ use eprofiler_proto::opentelemetry::proto::collector::profiles::v1development::E
 use eprofiler_proto::opentelemetry::proto::common::v1 as common;
 use eprofiler_proto::opentelemetry::proto::profiles::v1development as profiles;
 
-use crate::flamegraph::FlameGraph;
+use crate::flamegraph::SampledStack;
 use crate::frame::{Frame, FrameInfo, FrameKind, Runtime};
 use crate::storage::SymbolStore;
 
 /// Everything one export request contributes to the UI.
 pub struct ProfileBatch {
-    pub flamegraph: FlameGraph,
-    /// Total sample weight added to `flamegraph`.
+    /// Each distinct stack in the request, once, with its summed weight.
+    pub stacks: Vec<SampledStack>,
+    /// Total weight across `stacks`.
     pub samples: u64,
     /// Sample timestamps per thread, for the flamescope.
     pub timestamps: HashMap<Arc<str>, Vec<u64>>,
@@ -63,12 +64,16 @@ impl<'a> Decoder<'a> {
         let locations = decoder.resolve_locations();
 
         let mut batch = ProfileBatch {
-            flamegraph: FlameGraph::new(),
+            stacks: Vec::new(),
             samples: 0,
             timestamps: HashMap::new(),
             new_mappings: known.record(decoder.dict.mapping_paths()),
         };
-        let mut stacks: HashMap<i32, Vec<Frame>> = HashMap::new();
+        // Position in `batch.stacks` per stack and thread; `None` for samples
+        // that point at no stack. The thread is part of the key because the
+        // thread row comes from the sample, not the stack: threads running
+        // the same code share a stack index but must stay separate.
+        let mut slots: HashMap<(i32, &str), Option<usize>> = HashMap::new();
 
         let samples = req
             .resource_profiles
@@ -77,17 +82,23 @@ impl<'a> Decoder<'a> {
             .flat_map(|sp| &sp.profiles)
             .flat_map(|p| &p.samples);
         for sample in samples {
-            let stack = stacks
-                .entry(sample.stack_index)
-                .or_insert_with(|| decoder.stack(sample, &locations));
-            let Some(thread) = stack.first() else {
+            let key = (sample.stack_index, decoder.dict.thread_name(sample));
+            let slot = *slots.entry(key).or_insert_with(|| {
+                let frames = decoder.stack(sample, &locations);
+                (!frames.is_empty()).then(|| {
+                    batch.stacks.push(SampledStack { frames, weight: 0 });
+                    batch.stacks.len() - 1
+                })
+            });
+            let Some(slot) = slot else {
                 continue;
             };
+            let stack = &mut batch.stacks[slot];
 
             let value = if !sample.timestamps_unix_nano.is_empty() {
                 batch
                     .timestamps
-                    .entry(Arc::clone(&thread.name))
+                    .entry(Arc::clone(&stack.frames[0].name))
                     .or_default()
                     .extend_from_slice(&sample.timestamps_unix_nano);
                 sample.timestamps_unix_nano.len() as i64
@@ -97,7 +108,7 @@ impl<'a> Decoder<'a> {
                 1
             };
 
-            batch.flamegraph.add_stack(stack, value);
+            stack.weight += value;
             batch.samples += value as u64;
         }
         Some(batch)
@@ -388,5 +399,100 @@ mod tests {
         let store = SymbolStore::open(tmp.path()).unwrap();
         let req = ExportProfilesServiceRequest::default();
         assert!(Decoder::decode(&req, &store, &KnownMappings::default()).is_none());
+    }
+
+    /// Functions `a` and `b`, one stack each (indices 1 and 2), and
+    /// `thread.name` attributes for threads `t` (index 1) and `u` (index 2).
+    fn two_stack_dictionary() -> ProfilesDictionary {
+        let thread = |name: &str| KeyValueAndUnit {
+            key_strindex: 1,
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(name.into())),
+            }),
+            unit_strindex: 0,
+        };
+        ProfilesDictionary {
+            string_table: ["", "thread.name", "a", "b"].map(str::to_string).to_vec(),
+            attribute_table: vec![KeyValueAndUnit::default(), thread("t"), thread("u")],
+            function_table: [0, 2, 3]
+                .map(|name_strindex| Function {
+                    name_strindex,
+                    ..Default::default()
+                })
+                .to_vec(),
+            location_table: [0, 1, 2]
+                .map(|function_index| Location {
+                    lines: vec![Line {
+                        function_index,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })
+                .to_vec(),
+            stack_table: [vec![], vec![1], vec![2]]
+                .map(|location_indices| profiles::Stack { location_indices })
+                .to_vec(),
+            ..Default::default()
+        }
+    }
+
+    /// Decode `(stack index, thread attribute index, weight)` samples and
+    /// return each emitted stack as frame names plus weight.
+    fn decode_samples(samples: &[(i32, i32, i64)]) -> (Vec<(Vec<String>, i64)>, u64) {
+        let samples = samples
+            .iter()
+            .map(|&(stack_index, thread, weight)| profiles::Sample {
+                stack_index,
+                values: vec![weight],
+                attribute_indices: vec![thread],
+                ..Default::default()
+            })
+            .collect();
+        let req = ExportProfilesServiceRequest {
+            dictionary: Some(two_stack_dictionary()),
+            resource_profiles: vec![profiles::ResourceProfiles {
+                scope_profiles: vec![profiles::ScopeProfiles {
+                    profiles: vec![profiles::Profile {
+                        samples,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SymbolStore::open(tmp.path()).unwrap();
+        let batch = Decoder::decode(&req, &store, &KnownMappings::default()).unwrap();
+        let stacks = batch
+            .stacks
+            .iter()
+            .map(|s| {
+                (
+                    s.frames.iter().map(|f| f.name.to_string()).collect(),
+                    s.weight,
+                )
+            })
+            .collect();
+        (stacks, batch.samples)
+    }
+
+    fn stack(names: &[&str], weight: i64) -> (Vec<String>, i64) {
+        (names.iter().map(|n| n.to_string()).collect(), weight)
+    }
+
+    #[test]
+    fn samples_of_the_same_stack_collapse_into_one_weighted_entry() {
+        // Stack 0 is the null stack and is skipped.
+        let (stacks, samples) = decode_samples(&[(1, 1, 2), (2, 1, 1), (1, 1, 3), (0, 1, 9)]);
+        assert_eq!(stacks, [stack(&["t", "a"], 5), stack(&["t", "b"], 1)]);
+        assert_eq!(samples, 6);
+    }
+
+    #[test]
+    fn threads_sharing_a_stack_stay_separate() {
+        let (stacks, samples) = decode_samples(&[(1, 1, 2), (1, 2, 7), (1, 1, 1)]);
+        assert_eq!(stacks, [stack(&["t", "a"], 3), stack(&["u", "a"], 7)]);
+        assert_eq!(samples, 10);
     }
 }

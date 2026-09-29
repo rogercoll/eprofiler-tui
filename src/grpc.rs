@@ -54,7 +54,7 @@ impl ProfilesServer {
                 let _ = events.send(Event::MappingsDiscovered(batch.new_mappings));
             }
             let _ = events.send(Event::ProfileUpdate {
-                flamegraph: batch.flamegraph,
+                stacks: batch.stacks,
                 samples: batch.samples,
                 timestamps: batch.timestamps,
             });
@@ -202,19 +202,20 @@ mod tests {
         let event = rx.recv_timeout(Duration::from_secs(2)).unwrap();
         match event {
             Event::ProfileUpdate {
-                flamegraph,
+                stacks,
                 samples,
                 timestamps,
             } => {
                 assert_eq!(samples, 10);
                 assert!(timestamps.is_empty());
-                let thread = &flamegraph.root.children[0];
-                assert_eq!(&*thread.name, "worker-1");
-                assert_eq!(thread.total_value, 10);
-                assert_eq!(thread.kind, FrameKind::THREAD);
-                assert_eq!(&*thread.children[0].name, "main");
-                assert_eq!(thread.children[0].kind.runtime, Runtime::Unknown);
-                assert_eq!(&*thread.children[0].children[0].name, "do_work");
+                let [stack] = stacks.as_slice() else {
+                    panic!("expected one stack, got {stacks:?}");
+                };
+                let names: Vec<&str> = stack.frames.iter().map(|f| &*f.name).collect();
+                assert_eq!(names, ["worker-1", "main", "do_work"]);
+                assert_eq!(stack.weight, 10);
+                assert_eq!(stack.frames[0].kind, FrameKind::THREAD);
+                assert_eq!(stack.frames[1].kind.runtime, Runtime::Unknown);
             }
             _ => panic!("expected ProfileUpdate event"),
         }
@@ -255,7 +256,7 @@ mod tests {
         let event = rx.recv_timeout(Duration::from_secs(2)).unwrap();
         match event {
             Event::ProfileUpdate {
-                flamegraph,
+                stacks,
                 samples,
                 timestamps,
             } => {
@@ -264,8 +265,7 @@ mod tests {
                     timestamps.get("worker-1").unwrap(),
                     &vec![100, 200, 300, 400, 500]
                 );
-                let thread = &flamegraph.root.children[0];
-                assert_eq!(thread.total_value, 5);
+                assert_eq!(stacks[0].weight, 5);
             }
             _ => panic!("expected ProfileUpdate event"),
         }

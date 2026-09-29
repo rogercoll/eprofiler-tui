@@ -77,14 +77,14 @@ impl State {
             Event::Tick | Event::Resize => None,
             Event::Key(key) => self.handle_key(key),
             Event::ProfileUpdate {
-                flamegraph,
+                stacks,
                 samples,
                 timestamps,
             } => {
                 if !self.fg.frozen {
                     self.fs.record_timestamps(&timestamps);
                 }
-                self.fg.merge(flamegraph, samples);
+                self.fg.ingest(&stacks, samples);
                 None
             }
             Event::MappingsDiscovered(names) => {
@@ -138,7 +138,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::flamegraph::FlameGraph;
+    use crate::flamegraph::SampledStack;
 
     fn key(code: KeyCode) -> Event {
         Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
@@ -152,12 +152,12 @@ mod tests {
 
     fn populated_state() -> State {
         let mut state = State::new("addr".into(), vec![]);
-        let mut fg = FlameGraph::new();
-        fg.add_stack(&["worker-1".into(), "main".into()], 5);
-        fg.add_stack(&["other".into(), "main".into()], 5);
         let timestamps = HashMap::from([("worker-1".into(), vec![0u64])]);
         state.handle_event(Event::ProfileUpdate {
-            flamegraph: fg,
+            stacks: vec![
+                SampledStack::from_names(&["worker-1", "main"], 5),
+                SampledStack::from_names(&["other", "main"], 5),
+            ],
             samples: 10,
             timestamps,
         });

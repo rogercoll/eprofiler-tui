@@ -57,23 +57,6 @@ impl FlameNode {
         self.promote(idx);
     }
 
-    /// Add `other`'s samples to this node, moving any subtrees this node
-    /// lacks instead of copying them.
-    pub fn merge(&mut self, other: FlameNode) {
-        self.total_value += other.total_value;
-        self.self_value += other.self_value;
-        for other_child in other.children {
-            let idx = match self.child_index.get(&other_child.name) {
-                Some(&idx) => {
-                    self.children[idx].merge(other_child);
-                    idx
-                }
-                None => self.push_child(other_child),
-            };
-            self.promote(idx);
-        }
-    }
-
     fn push_child(&mut self, child: FlameNode) -> usize {
         let idx = self.children.len();
         self.child_index.insert(Arc::clone(&child.name), idx);
@@ -128,6 +111,24 @@ impl FlameNode {
         indices
             .iter()
             .try_fold(self, |node, &idx| node.children.get(idx))
+    }
+}
+
+/// One distinct call stack from a profile and the samples it received.
+#[derive(Debug)]
+pub struct SampledStack {
+    /// Root first: the thread, then its frames.
+    pub frames: Vec<Frame>,
+    pub weight: i64,
+}
+
+#[cfg(test)]
+impl SampledStack {
+    pub fn from_names(names: &[&str], weight: i64) -> Self {
+        Self {
+            frames: names.iter().map(|&n| n.into()).collect(),
+            weight,
+        }
     }
 }
 
@@ -189,23 +190,5 @@ mod tests {
             graph.add_stack(&[name.into()], 2);
         }
         assert_eq!(names(&graph.root), ["x", "y", "z"]);
-    }
-
-    #[test]
-    fn merge_keeps_order_and_moves_new_subtrees() {
-        let mut live = FlameGraph::new();
-        live.add_stack(&["t".into(), "hot".into()], 10);
-        live.add_stack(&["t".into(), "cold".into()], 1);
-
-        let mut update = FlameGraph::new();
-        update.add_stack(&["t".into(), "cold".into(), "deep".into()], 20);
-        update.add_stack(&["t".into(), "new".into()], 5);
-        live.root.merge(update.root);
-
-        let thread = live.root.child_by_name("t").unwrap();
-        assert_eq!(names(thread), ["cold", "hot", "new"]);
-        assert_eq!(thread.child_by_name("cold").unwrap().total_value, 21);
-        assert_eq!(live.root.total_value, 36);
-        assert_consistent(&live.root);
     }
 }

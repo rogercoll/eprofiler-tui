@@ -175,7 +175,6 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::flamegraph::FlameGraph;
     use crate::tui::event::Event;
     use crate::tui::state::{ActiveTab, State};
     use crate::tui::view::testing::render;
@@ -191,7 +190,7 @@ mod tests {
             .collect();
         let mut state = State::new("addr".into(), vec![]);
         state.handle_event(Event::ProfileUpdate {
-            flamegraph: FlameGraph::new(),
+            stacks: Vec::new(),
             samples: 0,
             timestamps: HashMap::from([("t".into(), ts)]),
         });

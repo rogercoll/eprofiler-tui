@@ -191,7 +191,7 @@ mod tests {
     use ratatui::crossterm::event::KeyCode;
 
     use super::*;
-    use crate::flamegraph::FlameGraph;
+    use crate::flamegraph::SampledStack;
     use crate::tui::event::Event;
     use crate::tui::state::State;
     use crate::tui::view::testing::{key, populated_state, render, screen};
@@ -219,10 +219,8 @@ mod tests {
         let before = bg_of(&mut state, &["worker-2", "main"]);
 
         // worker-2 overtakes worker-1, flipping the top-level order.
-        let mut fg = FlameGraph::new();
-        fg.add_stack(&["worker-2".into(), "other".into()], 100);
         state.handle_event(Event::ProfileUpdate {
-            flamegraph: fg,
+            stacks: vec![SampledStack::from_names(&["worker-2", "other"], 100)],
             samples: 100,
             timestamps: HashMap::new(),
         });

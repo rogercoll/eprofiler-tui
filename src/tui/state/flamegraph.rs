@@ -1,6 +1,6 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
-use crate::flamegraph::{FlameGraph, FlameNode};
+use crate::flamegraph::{FlameGraph, FlameNode, SampledStack};
 use crate::tui::theme;
 use crate::tui::widgets::{Picker, PickerEvent, PickerStyle};
 
@@ -55,11 +55,14 @@ impl Default for FlamegraphTab {
 }
 
 impl FlamegraphTab {
-    pub fn merge(&mut self, new_fg: FlameGraph, samples: u64) {
+    /// Add one profile's stacks, unless frozen.
+    pub fn ingest(&mut self, stacks: &[SampledStack], samples: u64) {
         if self.frozen {
             return;
         }
-        self.graph.root.merge(new_fg.root);
+        for stack in stacks {
+            self.graph.add_stack(&stack.frames, stack.weight);
+        }
         self.profiles_received += 1;
         self.samples_received += samples;
     }
