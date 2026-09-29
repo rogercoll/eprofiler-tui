@@ -108,7 +108,7 @@ impl Band {
             Runtime::Dotnet => Self::around(272.0),
             Runtime::Beam => Self::around(300.0),
             Runtime::Ruby => Self::around(330.0),
-            Runtime::Unknown | Runtime::Thread => Self {
+            Runtime::Unknown | Runtime::Thread | Runtime::Process => Self {
                 application: Tone::GREY,
                 runtime: Tone::GREY,
                 ..Self::around(0.0)

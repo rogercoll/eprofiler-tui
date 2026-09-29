@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
-use super::flamegraph::THREAD_PICKER;
+use super::flamegraph::PROCESS_PICKER;
 use crate::tui::widgets::{Cursor, Picker, PickerEvent};
 
 /// Samples are bucketed at 10ms. Display rows group whole buckets, so this
@@ -20,8 +20,8 @@ pub type Column = [u32; BUCKETS];
 pub struct FlamescopeTab {
     epoch_ns: Option<u64>,
     all: Timeline,
-    threads: HashMap<String, Timeline>,
-    thread_names: Vec<String>,
+    processes: HashMap<String, Timeline>,
+    process_names: Vec<String>,
     pub filter: Option<String>,
     pub picker: Option<Picker>,
     /// Follow the newest column as data arrives.
@@ -39,8 +39,8 @@ impl Default for FlamescopeTab {
         Self {
             epoch_ns: None,
             all: Timeline::default(),
-            threads: HashMap::new(),
-            thread_names: Vec::new(),
+            processes: HashMap::new(),
+            process_names: Vec::new(),
             filter: None,
             picker: None,
             auto_scroll: true,
@@ -87,18 +87,19 @@ impl FlamescopeTab {
     }
 
     pub fn record_timestamps(&mut self, entries: &HashMap<Arc<str>, Vec<u64>>) {
-        for (thread, timestamps) in entries {
-            let thread: &str = thread;
-            // Owned copies of the name are made only for threads seen for the first time.
-            if !self.threads.contains_key(thread) {
+        for (process, timestamps) in entries {
+            let process: &str = process;
+            // Owned copies of the name are made only for processes seen for the first time.
+            if !self.processes.contains_key(process) {
                 let pos = self
-                    .thread_names
-                    .binary_search_by(|name| name.as_str().cmp(thread))
+                    .process_names
+                    .binary_search_by(|name| name.as_str().cmp(process))
                     .unwrap_or_else(|e| e);
-                self.thread_names.insert(pos, thread.to_owned());
-                self.threads.insert(thread.to_owned(), Timeline::default());
+                self.process_names.insert(pos, process.to_owned());
+                self.processes
+                    .insert(process.to_owned(), Timeline::default());
             }
-            let thread_cols = self.threads.get_mut(thread).expect("inserted above");
+            let process_cols = self.processes.get_mut(process).expect("inserted above");
 
             for &ts in timestamps {
                 let epoch = *self.epoch_ns.get_or_insert(ts);
@@ -107,7 +108,7 @@ impl FlamescopeTab {
                 let bucket = ((offset % NS_PER_SEC) / NS_PER_BUCKET) as usize;
 
                 self.all.record(col, bucket);
-                thread_cols.record(col, bucket);
+                process_cols.record(col, bucket);
             }
         }
         self.sync_cursor();
@@ -119,7 +120,7 @@ impl FlamescopeTab {
 
     pub fn visible_columns(&self) -> &[Column] {
         match &self.filter {
-            Some(name) => self.threads.get(name).map_or(&[], |t| &t.0),
+            Some(name) => self.processes.get(name).map_or(&[], |t| &t.0),
             None => &self.all.0,
         }
     }
@@ -196,8 +197,8 @@ impl FlamescopeTab {
             }
             KeyCode::Up | KeyCode::Char('k') => self.row = self.row.saturating_sub(1),
             KeyCode::Char('/') => {
-                let mut picker = Picker::new(&THREAD_PICKER);
-                picker.refresh(self.thread_names.iter().map(String::as_str));
+                let mut picker = Picker::new(&PROCESS_PICKER);
+                picker.refresh(self.process_names.iter().map(String::as_str));
                 self.picker = Some(picker);
             }
             KeyCode::Esc => {
@@ -217,7 +218,7 @@ impl FlamescopeTab {
         };
         match picker.handle_key(key) {
             Some(PickerEvent::Changed) => {
-                picker.refresh(self.thread_names.iter().map(String::as_str))
+                picker.refresh(self.process_names.iter().map(String::as_str))
             }
             Some(PickerEvent::Cancel) => self.picker = None,
             Some(PickerEvent::Submit) => {

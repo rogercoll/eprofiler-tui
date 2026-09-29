@@ -212,10 +212,12 @@ mod tests {
                     panic!("expected one stack, got {stacks:?}");
                 };
                 let names: Vec<&str> = stack.frames.iter().map(|f| &*f.name).collect();
-                assert_eq!(names, ["worker-1", "main", "do_work"]);
+                // The request has no resource attributes, so the process is unknown.
+                assert_eq!(names, ["[unknown]", "worker-1", "main", "do_work"]);
                 assert_eq!(stack.weight, 10);
-                assert_eq!(stack.frames[0].kind, FrameKind::THREAD);
-                assert_eq!(stack.frames[1].kind.runtime, Runtime::Unknown);
+                assert_eq!(stack.frames[0].kind, FrameKind::PROCESS);
+                assert_eq!(stack.frames[1].kind, FrameKind::THREAD);
+                assert_eq!(stack.frames[2].kind.runtime, Runtime::Unknown);
             }
             _ => panic!("expected ProfileUpdate event"),
         }
@@ -262,7 +264,7 @@ mod tests {
             } => {
                 assert_eq!(samples, 5);
                 assert_eq!(
-                    timestamps.get("worker-1").unwrap(),
+                    timestamps.get("[unknown]").unwrap(),
                     &vec![100, 200, 300, 400, 500]
                 );
                 assert_eq!(stacks[0].weight, 5);

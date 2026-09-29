@@ -34,7 +34,7 @@ impl TabView for FlamescopeTab {
             let msg = if self.is_empty() {
                 "No profile data yet"
             } else {
-                "No data for this thread"
+                "No data for this process"
             };
             Placeholder(msg).render(area, buf);
             return;
