@@ -5,9 +5,9 @@
 //!
 //! - **hue** comes from the runtime (Go is cyan, JVM green, ...), with a small
 //!   per-name offset so adjacent siblings stay distinguishable;
-//! - **saturation** separates application code (vivid) from runtime, stdlib
-//!   and system code (muted). Kernel frames stay vivid so kernel time stands
-//!   out;
+//! - **tone** separates application code (vivid) from runtime, stdlib and
+//!   system code (a pastel tint of the same hue). Kernel frames stay vivid so
+//!   kernel time stands out;
 //! - **lightness** grows with self time, so frames that burn CPU themselves
 //!   glow and pass-through frames stay dark. Width already shows total time.
 
@@ -39,6 +39,15 @@ struct Band {
     runtime: Tone,
 }
 
+/// Runtime, stdlib and system frames: a pastel tint of the runtime's hue.
+/// Mixing toward white rather than grey keeps them pleasant, while vivid
+/// color stays reserved for application code.
+const PASTEL: Tone = Tone {
+    sat: 0.80,
+    light_min: 0.76,
+    light_range: 0.08,
+};
+
 impl Band {
     const fn around(center: f64) -> Self {
         Self {
@@ -49,20 +58,14 @@ impl Band {
                 light_min: 0.42,
                 light_range: 0.24,
             },
-            runtime: Tone {
-                sat: 0.28,
-                light_min: 0.42,
-                light_range: 0.24,
-            },
+            runtime: PASTEL,
         }
     }
 }
 
 /// Brendan Gregg's "hot" scheme: each name lands somewhere between red and
 /// yellow, at full saturation, since dim orange and yellow read as brown.
-/// Runtime frames use pastel tints of the same hues (peach, cream, salmon):
-/// mixing toward white rather than grey keeps them pleasant while vivid
-/// color stays reserved for application code.
+/// Runtime frames become salmon, peach and cream.
 const NATIVE: Band = Band {
     center: 27.0,
     spread: 25.0,
@@ -71,11 +74,7 @@ const NATIVE: Band = Band {
         light_min: 0.50,
         light_range: 0.16,
     },
-    runtime: Tone {
-        sat: 0.80,
-        light_min: 0.76,
-        light_range: 0.08,
-    },
+    runtime: PASTEL,
 };
 
 /// The band for a runtime, or `None` for grey (non-code rows and unknown frames).
@@ -211,19 +210,25 @@ mod tests {
     }
 
     #[test]
-    fn runtime_frames_are_muted_except_kernel() {
-        for runtime in [Runtime::Native, Runtime::Go, Runtime::Jvm, Runtime::Python] {
+    fn runtime_frames_are_pastel_except_kernel() {
+        for runtime in Runtime::ALL.into_iter().filter(|r| band(*r).is_some()) {
             let app = swatch(runtime, Origin::Application);
             let rt = swatch(runtime, Origin::Runtime);
+            if runtime == Runtime::Kernel {
+                assert_eq!(app, rt, "kernel stays vivid");
+                continue;
+            }
+            // Pastel: lighter and softer than the vivid tone, yet clearly colored.
             assert!(
-                chroma(app) > chroma(rt) * 2,
-                "{runtime:?}: {app:?} vs {rt:?}"
+                luma(rt) > luma(app),
+                "{runtime:?}: {rt:?} not lighter than {app:?}"
             );
+            assert!(
+                chroma(rt) < chroma(app),
+                "{runtime:?}: {rt:?} not softer than {app:?}"
+            );
+            assert!(chroma(rt) > 50, "{runtime:?}: {rt:?} is greyish");
         }
-        assert_eq!(
-            swatch(Runtime::Kernel, Origin::Runtime),
-            swatch(Runtime::Kernel, Origin::Application)
-        );
     }
 
     #[test]
