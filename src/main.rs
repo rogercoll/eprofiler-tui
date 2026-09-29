@@ -7,6 +7,8 @@ use directories::ProjectDirs;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
+#[cfg(test)]
+mod bench;
 mod debug;
 mod error;
 mod flamegraph;
