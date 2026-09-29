@@ -226,7 +226,7 @@ mod tests {
             samples: 100,
             timestamps: HashMap::new(),
         });
-        assert_eq!(state.fg.graph.root.children[0].name, "worker-2");
+        assert_eq!(&*state.fg.graph.root.children[0].name, "worker-2");
         assert_eq!(bg_of(&mut state, &["worker-2", "main"]), before);
 
         state.fg.zoom_path = vec!["worker-2".into()];

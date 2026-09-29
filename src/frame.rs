@@ -6,6 +6,7 @@
 //! is stable across updates and zoom levels.
 
 use std::fmt;
+use std::sync::Arc;
 
 /// Runtime that produced a frame, from the OTLP `profile.frame.type` attribute.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
@@ -120,12 +121,12 @@ impl fmt::Display for FrameKind {
 /// One element of a stack: a label plus what kind of code it is.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Frame {
-    pub name: String,
+    pub name: Arc<str>,
     pub kind: FrameKind,
 }
 
 impl Frame {
-    pub fn thread(name: impl Into<String>) -> Self {
+    pub fn thread(name: impl Into<Arc<str>>) -> Self {
         Self {
             name: name.into(),
             kind: FrameKind::THREAD,
@@ -136,7 +137,7 @@ impl Frame {
 impl From<&str> for Frame {
     fn from(name: &str) -> Self {
         Self {
-            name: name.to_owned(),
+            name: name.into(),
             kind: FrameKind::default(),
         }
     }

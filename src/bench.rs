@@ -123,6 +123,7 @@ impl Report {
             report.merge_heap += heap;
         }
         report.nodes = count_nodes(&state.fg.graph.root);
+        assert_heaviest_first(&state.fg.graph.root);
 
         let mut term = Terminal::new(TestBackend::new(SCREEN.0, SCREEN.1)).unwrap();
         let ((), time, heap) = measure(|| {
@@ -139,6 +140,13 @@ impl Report {
 
 fn count_nodes(node: &FlameNode) -> usize {
     1 + node.children.iter().map(count_nodes).sum::<usize>()
+}
+
+/// Guards against a faster merge that stops keeping siblings in order.
+fn assert_heaviest_first(node: &FlameNode) {
+    let totals = node.children.iter().map(|c| c.total_value);
+    assert!(totals.clone().zip(totals.skip(1)).all(|(a, b)| a >= b));
+    node.children.iter().for_each(assert_heaviest_first);
 }
 
 /// Run `f`, returning its result, elapsed time and heap allocations.

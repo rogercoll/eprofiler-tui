@@ -113,7 +113,7 @@ pub(crate) mod testing {
         state.handle_event(Event::ProfileUpdate {
             flamegraph: fg,
             samples: 40,
-            timestamps: HashMap::from([("worker-1".to_string(), vec![0u64, 1_500_000_000])]),
+            timestamps: HashMap::from([("worker-1".into(), vec![0u64, 1_500_000_000])]),
         });
         state.handle_event(Event::MappingsDiscovered(vec![
             "libc.so.6".into(),

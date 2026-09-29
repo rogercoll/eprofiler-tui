@@ -19,7 +19,7 @@ pub enum Event {
     ProfileUpdate {
         flamegraph: FlameGraph,
         samples: u64,
-        timestamps: HashMap<String, Vec<u64>>,
+        timestamps: HashMap<Arc<str>, Vec<u64>>,
     },
     MappingsDiscovered(Vec<String>),
     SymbolsLoaded {
