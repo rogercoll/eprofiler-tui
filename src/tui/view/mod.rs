@@ -139,13 +139,18 @@ pub(crate) mod testing {
 mod tests {
     use ratatui::crossterm::event::KeyCode;
 
-    use super::testing::{key, populated_state, screen};
+    use ratatui::style::Color;
+
+    use super::testing::{key, populated_state, render, screen};
     use crate::tui::state::State;
 
     #[test]
     fn waiting_screen_before_data() {
         let mut state = State::new("0.0.0.0:4317".into(), vec![]);
         assert!(screen(&mut state, 100, 20).contains("Listening on 0.0.0.0:4317"));
+        // Like the tabs, the landing page keeps the terminal background.
+        let buf = render(&mut state, 120, 30);
+        assert!(buf.content.iter().all(|cell| cell.bg == Color::Reset));
     }
 
     #[test]

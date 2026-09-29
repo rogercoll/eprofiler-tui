@@ -15,7 +15,7 @@ use super::DebugState;
 use crate::tui::canvas::BufferExt;
 use crate::tui::text::{format_duration, format_hex, format_timestamp, truncate};
 use crate::tui::theme::{
-    ACCENT, ACCENT_LIGHT, ACCENT_PALE, AMBER, BG, BRIGHT, CYAN, DIM, ERROR, FAINT, LIME,
+    ACCENT, ACCENT_LIGHT, ACCENT_PALE, AMBER, BRIGHT, CYAN, DIM, ERROR, FAINT, LIME,
     MATCH_ACTIVE_BG, MATCH_BG, MUTED, MUTED_DARK, ORANGE, POPUP_BORDER, PURPLE, RULE, SUCCESS,
     TEXT, YELLOW,
 };
@@ -538,32 +538,31 @@ impl DebugState {
 
     fn render_waiting(&self, frame: &mut Frame, area: Rect) {
         let buf = frame.buffer_mut();
-        let bg = Style::default().bg(BG);
-        buf.fill(area, bg);
+        let text = Style::default();
         let cy = area.y + area.height / 2;
         buf.center(
             area,
             cy.saturating_sub(2),
             "◆ eprofiler-tui debug",
-            bg.fg(ACCENT).add_modifier(Modifier::BOLD),
+            text.fg(ACCENT).add_modifier(Modifier::BOLD),
         );
         buf.center(
             area,
             cy,
             &format!("Listening on {}", self.listen_addr),
-            bg.fg(BRIGHT),
+            text.fg(BRIGHT),
         );
         buf.center(
             area,
             cy + 1,
             "Waiting for profiles...",
-            bg.fg(DIM).add_modifier(Modifier::ITALIC),
+            text.fg(DIM).add_modifier(Modifier::ITALIC),
         );
         buf.center(
             area,
             cy + 3,
             "Send OTLP profiles to inspect them",
-            bg.fg(MUTED_DARK),
+            text.fg(MUTED_DARK),
         );
     }
 

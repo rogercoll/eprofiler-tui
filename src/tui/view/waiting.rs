@@ -38,9 +38,6 @@ impl Waiting<'_> {
 
 impl Widget for Waiting<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let on_bg = |style: Style| style.bg(theme::BG);
-        buf.fill(area, on_bg(Style::reset()));
-
         let logo_h = Self::LOGO.len() as u16;
         let logo_w = Self::LOGO
             .iter()
@@ -53,10 +50,10 @@ impl Widget for Waiting<'_> {
         if area.width >= logo_w + 2 && area.height >= total_h {
             let x = area.x + area.width.saturating_sub(logo_w) / 2;
             for (i, (line, color)) in Self::LOGO.iter().zip(Self::LOGO_COLORS).enumerate() {
-                buf.set_string(x, top + i as u16, line, on_bg(Style::new().fg(color)));
+                buf.set_string(x, top + i as u16, line, Style::new().fg(color));
             }
         } else {
-            let style = on_bg(Style::new().fg(Self::LOGO_COLORS[4]).bold());
+            let style = Style::new().fg(Self::LOGO_COLORS[4]).bold();
             buf.center(area, top + 1, "◆ eprofiler-tui", style);
         }
 
@@ -65,15 +62,15 @@ impl Widget for Waiting<'_> {
             area,
             y,
             Self::SUBTITLE,
-            on_bg(Style::new().fg(theme::BRIGHT).bold()),
+            Style::new().fg(theme::BRIGHT).bold(),
         );
         let rule_w = Self::SUBTITLE.len() as u16;
         let rule_x = area.x + area.width.saturating_sub(rule_w) / 2;
-        let rule = on_bg(Style::new().fg(theme::RULE));
+        let rule = Style::new().fg(theme::RULE);
         buf.hline(y + 1, rule_x, rule_x + rule_w, '─', rule);
         let address = format!("Listening on {}", self.0);
-        buf.center(area, y + 2, &address, on_bg(Style::new().fg(theme::MUTED)));
-        let waiting = on_bg(Style::new().fg(theme::DIM).italic());
+        buf.center(area, y + 2, &address, Style::new().fg(theme::MUTED));
+        let waiting = Style::new().fg(theme::DIM).italic();
         buf.center(area, y + 3, "Waiting for profiles...", waiting);
     }
 }

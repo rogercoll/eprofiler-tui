@@ -15,7 +15,6 @@ pub const DIM: Color = Color::Rgb(70, 70, 85);
 pub const FAINT: Color = Color::Rgb(55, 55, 65);
 pub const RULE: Color = Color::Rgb(35, 35, 45);
 pub const GHOST: Color = Color::Rgb(30, 30, 38);
-pub const BG: Color = Color::Rgb(16, 16, 22);
 
 // Accent scale.
 pub const ACCENT: Color = Color::Rgb(59, 130, 246);
