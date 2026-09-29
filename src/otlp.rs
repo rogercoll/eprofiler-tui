@@ -17,7 +17,7 @@ pub struct ProfileBatch {
     pub stacks: Vec<SampledStack>,
     /// Total weight across `stacks`.
     pub samples: u64,
-    /// Sample timestamps per thread, for the flamescope.
+    /// Sample timestamps per process, for the flamescope.
     pub timestamps: HashMap<Arc<str>, Vec<u64>>,
     /// Basenames of executables seen for the first time.
     pub new_mappings: Vec<String>,
@@ -69,27 +69,28 @@ impl<'a> Decoder<'a> {
             timestamps: HashMap::new(),
             new_mappings: known.record(decoder.dict.mapping_paths()),
         };
-        // Position in `batch.stacks` per stack and thread; `None` for samples
-        // that point at no stack. The thread is part of the key because the
-        // thread row comes from the sample, not the stack: threads running
-        // the same code share a stack index but must stay separate.
-        let mut slots: HashMap<(i32, &str), Option<usize>> = HashMap::new();
+        // Position in `batch.stacks` per stack, process and thread; `None` for
+        // samples that point at no stack. The dictionary is shared by every
+        // process in the request and the thread comes from each sample, so
+        // the same stack index can belong to several processes and threads.
+        let mut slots: HashMap<(i32, &str, &str), Option<usize>> = HashMap::new();
 
-        let samples = req
-            .resource_profiles
-            .iter()
-            .flat_map(|rp| &rp.scope_profiles)
-            .flat_map(|sp| &sp.profiles)
-            .flat_map(|p| &p.samples);
-        for sample in samples {
-            let key = (sample.stack_index, decoder.dict.thread_name(sample));
-            let slot = *slots.entry(key).or_insert_with(|| {
-                let frames = decoder.stack(sample, &locations);
-                (!frames.is_empty()).then(|| {
-                    batch.stacks.push(SampledStack { frames, weight: 0 });
-                    batch.stacks.len() - 1
-                })
-            });
+        // The agent sends one resource per process.
+        let samples = req.resource_profiles.iter().flat_map(|rp| {
+            let process = decoder.process_label(rp, &locations);
+            Self::samples_of(rp).map(move |sample| (process, sample))
+        });
+        for (process, sample) in samples {
+            let thread = decoder.dict.thread_name(sample);
+            let slot = *slots
+                .entry((sample.stack_index, process, thread))
+                .or_insert_with(|| {
+                    let frames = decoder.stack(process, thread, sample, &locations);
+                    (!frames.is_empty()).then(|| {
+                        batch.stacks.push(SampledStack { frames, weight: 0 });
+                        batch.stacks.len() - 1
+                    })
+                });
             let Some(slot) = slot else {
                 continue;
             };
@@ -114,16 +115,62 @@ impl<'a> Decoder<'a> {
         Some(batch)
     }
 
-    /// Root-first stack for `sample`: its thread row, then its frames.
-    /// Empty when the sample points at no stack.
-    fn stack(&self, sample: &profiles::Sample, locations: &[Frame]) -> Vec<Frame> {
-        let Some(stack) = self
-            .dict
+    fn samples_of(
+        rp: &'a profiles::ResourceProfiles,
+    ) -> impl Iterator<Item = &'a profiles::Sample> {
+        rp.scope_profiles
+            .iter()
+            .flat_map(|sp| &sp.profiles)
+            .flat_map(|p| &p.samples)
+    }
+
+    /// Label of a resource's process row: its `process.executable.name`.
+    /// Without one it is `[kernel]` when every sampled stack is kernel code,
+    /// as for kernel threads, which have no executable; otherwise `[unknown]`.
+    fn process_label(&self, rp: &'a profiles::ResourceProfiles, locations: &[Frame]) -> &'a str {
+        let executable = rp
+            .resource
+            .iter()
+            .flat_map(|r| &r.attributes)
+            .find(|kv| kv.key == "process.executable.name")
+            .and_then(|kv| match kv.value.as_ref()?.value.as_ref()? {
+                common::any_value::Value::StringValue(s) if !s.is_empty() => Some(s.as_str()),
+                _ => None,
+            });
+        if let Some(name) = executable {
+            return name;
+        }
+        let kernel_only = Self::samples_of(rp)
+            .filter_map(|sample| self.stack_of(sample))
+            .flat_map(|stack| &stack.location_indices)
+            .all(|&idx| {
+                locations
+                    .get(idx as usize)
+                    .is_some_and(|frame| frame.kind.runtime == Runtime::Kernel)
+            });
+        if kernel_only { "[kernel]" } else { "[unknown]" }
+    }
+
+    /// The stack `sample` points at; `None` for the null stack.
+    fn stack_of(&self, sample: &profiles::Sample) -> Option<&'a profiles::Stack> {
+        self.dict
             .d
             .stack_table
             .get(sample.stack_index as usize)
             .filter(|_| sample.stack_index > 0)
-        else {
+    }
+
+    /// Root-first stack for `sample`: its process row, its thread row unless
+    /// that just repeats the process name, then its frames. Empty when the
+    /// sample points at no stack.
+    fn stack(
+        &self,
+        process: &str,
+        thread: &str,
+        sample: &profiles::Sample,
+        locations: &[Frame],
+    ) -> Vec<Frame> {
+        let Some(stack) = self.stack_of(sample) else {
             return Vec::new();
         };
         let frames = stack
@@ -131,9 +178,19 @@ impl<'a> Decoder<'a> {
             .iter()
             .rev()
             .filter_map(|&idx| locations.get(idx as usize).cloned());
-        std::iter::once(Frame::thread(self.dict.thread_name(sample)))
+        let thread = (!Self::is_main_thread(thread, process)).then(|| Frame::thread(thread));
+        std::iter::once(Frame::process(process))
+            .chain(thread)
             .chain(frames)
             .collect()
+    }
+
+    /// Whether `thread` is named after `process`, as a main thread is. Linux
+    /// truncates thread names to 15 bytes, so a full-length thread name that
+    /// prefixes the executable name counts too.
+    fn is_main_thread(thread: &str, process: &str) -> bool {
+        const THREAD_NAME_MAX: usize = 15;
+        thread == process || (thread.len() == THREAD_NAME_MAX && process.starts_with(thread))
     }
 
     /// Every entry of the location table as a labeled, classified frame.
@@ -282,6 +339,7 @@ impl<'a> Dict<'a> {
 mod tests {
     use super::*;
     use common::{AnyValue, any_value};
+    use eprofiler_proto::opentelemetry::proto::resource::v1::Resource;
     use profiles::{Function, KeyValueAndUnit, Line, Location, ProfilesDictionary};
 
     #[test]
@@ -436,21 +494,48 @@ mod tests {
         }
     }
 
-    /// Decode `(stack index, thread attribute index, weight)` samples and
-    /// return each emitted stack as frame names plus weight.
-    fn decode_samples(samples: &[(i32, i32, i64)]) -> (Vec<(Vec<String>, i64)>, u64) {
-        let samples = samples
-            .iter()
-            .map(|&(stack_index, thread, weight)| profiles::Sample {
-                stack_index,
-                values: vec![weight],
-                attribute_indices: vec![thread],
-                ..Default::default()
-            })
-            .collect();
-        let req = ExportProfilesServiceRequest {
-            dictionary: Some(two_stack_dictionary()),
-            resource_profiles: vec![profiles::ResourceProfiles {
+    /// `(stack index, thread attribute index, weight)`.
+    type TestSample = (i32, i32, i64);
+
+    /// Decode one resource per `(process, samples)` and return each emitted
+    /// stack as frame names plus weight. A `None` process has no
+    /// `process.executable.name` attribute.
+    fn decode_processes(
+        processes: &[(Option<&str>, &[TestSample])],
+    ) -> (Vec<(Vec<String>, i64)>, u64) {
+        decode_processes_with(two_stack_dictionary(), processes)
+    }
+
+    /// Like [`decode_processes`], with a custom dictionary.
+    fn decode_processes_with(
+        dict: ProfilesDictionary,
+        processes: &[(Option<&str>, &[TestSample])],
+    ) -> (Vec<(Vec<String>, i64)>, u64) {
+        let resource = |(process, samples): &(Option<&str>, &[TestSample])| {
+            let samples = samples
+                .iter()
+                .map(|&(stack_index, thread, weight)| profiles::Sample {
+                    stack_index,
+                    values: vec![weight],
+                    attribute_indices: vec![thread],
+                    ..Default::default()
+                })
+                .collect();
+            let attributes = process
+                .map(|name| common::KeyValue {
+                    key: "process.executable.name".into(),
+                    value: Some(AnyValue {
+                        value: Some(any_value::Value::StringValue(name.into())),
+                    }),
+                    ..Default::default()
+                })
+                .into_iter()
+                .collect();
+            profiles::ResourceProfiles {
+                resource: Some(Resource {
+                    attributes,
+                    ..Default::default()
+                }),
                 scope_profiles: vec![profiles::ScopeProfiles {
                     profiles: vec![profiles::Profile {
                         samples,
@@ -459,7 +544,11 @@ mod tests {
                     ..Default::default()
                 }],
                 ..Default::default()
-            }],
+            }
+        };
+        let req = ExportProfilesServiceRequest {
+            dictionary: Some(dict),
+            resource_profiles: processes.iter().map(resource).collect(),
         };
         let tmp = tempfile::tempdir().unwrap();
         let store = SymbolStore::open(tmp.path()).unwrap();
@@ -477,6 +566,11 @@ mod tests {
         (stacks, batch.samples)
     }
 
+    /// All `samples` from one process named `app`.
+    fn decode_samples(samples: &[TestSample]) -> (Vec<(Vec<String>, i64)>, u64) {
+        decode_processes(&[(Some("app"), samples)])
+    }
+
     fn stack(names: &[&str], weight: i64) -> (Vec<String>, i64) {
         (names.iter().map(|n| n.to_string()).collect(), weight)
     }
@@ -485,14 +579,110 @@ mod tests {
     fn samples_of_the_same_stack_collapse_into_one_weighted_entry() {
         // Stack 0 is the null stack and is skipped.
         let (stacks, samples) = decode_samples(&[(1, 1, 2), (2, 1, 1), (1, 1, 3), (0, 1, 9)]);
-        assert_eq!(stacks, [stack(&["t", "a"], 5), stack(&["t", "b"], 1)]);
+        assert_eq!(
+            stacks,
+            [stack(&["app", "t", "a"], 5), stack(&["app", "t", "b"], 1)]
+        );
         assert_eq!(samples, 6);
     }
 
     #[test]
     fn threads_sharing_a_stack_stay_separate() {
         let (stacks, samples) = decode_samples(&[(1, 1, 2), (1, 2, 7), (1, 1, 1)]);
-        assert_eq!(stacks, [stack(&["t", "a"], 3), stack(&["u", "a"], 7)]);
+        assert_eq!(
+            stacks,
+            [stack(&["app", "t", "a"], 3), stack(&["app", "u", "a"], 7)]
+        );
         assert_eq!(samples, 10);
+    }
+
+    #[test]
+    fn processes_sharing_a_stack_and_thread_name_stay_separate() {
+        let (stacks, _) =
+            decode_processes(&[(Some("api"), &[(1, 1, 2)]), (Some("worker"), &[(1, 1, 5)])]);
+        assert_eq!(
+            stacks,
+            [
+                stack(&["api", "t", "a"], 2),
+                stack(&["worker", "t", "a"], 5)
+            ]
+        );
+    }
+
+    #[test]
+    fn processes_without_an_executable_name_are_unknown() {
+        let (stacks, _) = decode_processes(&[(None, &[(1, 1, 1)])]);
+        assert_eq!(stacks, [stack(&["[unknown]", "t", "a"], 1)]);
+    }
+
+    #[test]
+    fn main_threads_named_after_their_process_get_no_thread_row() {
+        let mut dict = two_stack_dictionary();
+        for name in ["app", "opentelemetry-c"] {
+            dict.attribute_table.push(KeyValueAndUnit {
+                key_strindex: 1,
+                value: Some(AnyValue {
+                    value: Some(any_value::Value::StringValue(name.into())),
+                }),
+                unit_strindex: 0,
+            });
+        }
+        // Attribute 3 is thread "app", attribute 4 is the 15-byte truncation
+        // of "opentelemetry-collector"; attribute 1 is an ordinary thread "t".
+        let (stacks, _) = decode_processes_with(
+            dict,
+            &[
+                (Some("app"), &[(1, 3, 1), (1, 1, 2)]),
+                (Some("opentelemetry-collector"), &[(2, 4, 3)]),
+            ],
+        );
+        assert_eq!(
+            stacks,
+            [
+                stack(&["app", "a"], 1),
+                stack(&["app", "t", "a"], 2),
+                stack(&["opentelemetry-collector", "b"], 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_full_length_thread_names_count_as_truncated() {
+        assert!(Decoder::is_main_thread("app", "app"));
+        assert!(Decoder::is_main_thread(
+            "opentelemetry-c",
+            "opentelemetry-collector"
+        ));
+        assert!(!Decoder::is_main_thread("open", "opentelemetry-collector"));
+        assert!(!Decoder::is_main_thread("tokio-rt-worker", "eprofiler-tui"));
+    }
+
+    #[test]
+    fn nameless_kernel_only_processes_are_labeled_kernel() {
+        // Stack 1's only frame is kernel code; stack 2's is not.
+        let mut dict = two_stack_dictionary();
+        dict.string_table
+            .extend(["profile.frame.type", "kernel"].map(str::to_string));
+        dict.attribute_table.push(KeyValueAndUnit {
+            key_strindex: dict.string_table.len() as i32 - 2,
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue("kernel".into())),
+            }),
+            unit_strindex: 0,
+        });
+        dict.location_table[1].attribute_indices = vec![dict.attribute_table.len() as i32 - 1];
+
+        let (stacks, _) = decode_processes_with(
+            dict,
+            &[(None, &[(1, 1, 4)]), (None, &[(1, 2, 1), (2, 2, 1)])],
+        );
+        assert_eq!(
+            stacks,
+            [
+                stack(&["[kernel]", "t", "a"], 4),
+                stack(&["[unknown]", "u", "a"], 1),
+                stack(&["[unknown]", "u", "b"], 1),
+            ]
+        );
     }
 }

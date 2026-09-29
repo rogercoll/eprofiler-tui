@@ -10,9 +10,9 @@ pub const SEARCH_KEYS: &[(&str, &str)] = &[
     ("[↑↓]", " navigate "),
 ];
 
-pub static THREAD_PICKER: PickerStyle = PickerStyle {
-    title: " thread.name ",
-    placeholder: "type to filter threads...",
+pub static PROCESS_PICKER: PickerStyle = PickerStyle {
+    title: " process ",
+    placeholder: "type to filter processes...",
     border: theme::POPUP_BORDER,
     width: 50,
     max_visible: 3,
@@ -104,14 +104,14 @@ impl FlamegraphTab {
     }
 
     fn open_search(&mut self) {
-        let mut picker = Picker::new(&THREAD_PICKER);
-        picker.refresh(self.thread_names());
+        let mut picker = Picker::new(&PROCESS_PICKER);
+        picker.refresh(self.process_names());
         self.picker = Some(picker);
     }
 
-    fn thread_names(&self) -> impl Iterator<Item = &str> {
+    fn process_names(&self) -> impl Iterator<Item = &str> {
         let root = &self.graph[FlameGraph::ROOT];
-        root.children.iter().map(|&t| &*self.graph[t].name)
+        root.children.iter().map(|&p| &*self.graph[p].name)
     }
 
     fn handle_picker_key(&mut self, key: KeyEvent) {
@@ -121,17 +121,17 @@ impl FlamegraphTab {
         match picker.handle_key(key) {
             Some(PickerEvent::Changed) => {
                 let root = &self.graph[FlameGraph::ROOT];
-                picker.refresh(root.children.iter().map(|&t| &*self.graph[t].name));
+                picker.refresh(root.children.iter().map(|&p| &*self.graph[p].name));
             }
             Some(PickerEvent::Cancel) => self.picker = None,
             Some(PickerEvent::Submit) => {
                 let picked = self.picker.take();
-                let thread = picked
+                let process = picked
                     .as_ref()
                     .and_then(|p| p.selected())
                     .and_then(|name| self.graph.child(FlameGraph::ROOT, name));
-                if let Some(thread) = thread {
-                    self.zoom_to(thread);
+                if let Some(process) = process {
+                    self.zoom_to(process);
                 }
             }
             None => {}

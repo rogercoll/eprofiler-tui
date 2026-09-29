@@ -26,6 +26,8 @@ pub enum Runtime {
     Unknown,
     /// Synthetic rows that are not code: the graph root and per-thread rows.
     Thread,
+    /// Synthetic per-process rows, above their threads.
+    Process,
 }
 
 impl Runtime {
@@ -61,6 +63,7 @@ impl Runtime {
             Self::Perl => "Perl",
             Self::Unknown => "Unknown",
             Self::Thread => "Thread",
+            Self::Process => "Process",
         }
     }
 }
@@ -94,6 +97,7 @@ pub struct FrameKind {
 
 impl FrameKind {
     pub const THREAD: Self = Self::new(Runtime::Thread, Origin::Application);
+    pub const PROCESS: Self = Self::new(Runtime::Process, Origin::Application);
 
     pub const fn new(runtime: Runtime, origin: Origin) -> Self {
         Self {
@@ -108,7 +112,10 @@ impl fmt::Display for FrameKind {
     /// `Go · runtime`, `Python · application · inlined`, `Thread`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.runtime.label())?;
-        if !matches!(self.runtime, Runtime::Thread | Runtime::Unknown) {
+        if !matches!(
+            self.runtime,
+            Runtime::Thread | Runtime::Process | Runtime::Unknown
+        ) {
             write!(f, " · {}", self.origin.label())?;
         }
         if self.inlined {
@@ -130,6 +137,13 @@ impl Frame {
         Self {
             name: name.into(),
             kind: FrameKind::THREAD,
+        }
+    }
+
+    pub fn process(name: impl Into<Arc<str>>) -> Self {
+        Self {
+            name: name.into(),
+            kind: FrameKind::PROCESS,
         }
     }
 }
@@ -374,6 +388,7 @@ mod tests {
     #[test]
     fn kinds_display_runtime_origin_and_inlining() {
         assert_eq!(FrameKind::THREAD.to_string(), "Thread");
+        assert_eq!(FrameKind::PROCESS.to_string(), "Process");
         let go = FrameKind {
             inlined: true,
             ..FrameKind::new(Runtime::Go, Origin::Runtime)
