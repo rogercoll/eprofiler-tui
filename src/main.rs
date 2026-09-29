@@ -9,6 +9,7 @@ use ratatui::backend::CrosstermBackend;
 mod debug;
 mod error;
 mod flamegraph;
+mod frame;
 mod grpc;
 mod storage;
 mod symbolizer;
