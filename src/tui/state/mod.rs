@@ -155,7 +155,7 @@ mod tests {
         let mut fg = FlameGraph::new();
         fg.add_stack(&["worker-1".into(), "main".into()], 5);
         fg.add_stack(&["other".into(), "main".into()], 5);
-        let timestamps = HashMap::from([("worker-1".to_string(), vec![0u64])]);
+        let timestamps = HashMap::from([("worker-1".into(), vec![0u64])]);
         state.handle_event(Event::ProfileUpdate {
             flamegraph: fg,
             samples: 10,

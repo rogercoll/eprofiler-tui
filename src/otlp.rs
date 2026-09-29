@@ -1,7 +1,7 @@
 //! Decoding of OTLP profile export requests into flamegraph data.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use eprofiler_proto::opentelemetry::proto::collector::profiles::v1development::ExportProfilesServiceRequest;
 use eprofiler_proto::opentelemetry::proto::common::v1 as common;
@@ -17,7 +17,7 @@ pub struct ProfileBatch {
     /// Total sample weight added to `flamegraph`.
     pub samples: u64,
     /// Sample timestamps per thread, for the flamescope.
-    pub timestamps: HashMap<String, Vec<u64>>,
+    pub timestamps: HashMap<Arc<str>, Vec<u64>>,
     /// Basenames of executables seen for the first time.
     pub new_mappings: Vec<String>,
 }
@@ -87,7 +87,7 @@ impl<'a> Decoder<'a> {
             let value = if !sample.timestamps_unix_nano.is_empty() {
                 batch
                     .timestamps
-                    .entry(thread.name.clone())
+                    .entry(Arc::clone(&thread.name))
                     .or_default()
                     .extend_from_slice(&sample.timestamps_unix_nano);
                 sample.timestamps_unix_nano.len() as i64
@@ -168,7 +168,7 @@ impl<'a> Decoder<'a> {
                 origin: info.origin(runtime),
                 inlined: names.len() > 1,
             },
-            name: names.join(" / "),
+            name: names.join(" / ").into(),
         }
     }
 
@@ -338,14 +338,7 @@ mod tests {
         let frames = decoder.resolve_locations();
         let kinds: Vec<_> = frames[1..]
             .iter()
-            .map(|f| {
-                (
-                    f.name.as_str(),
-                    f.kind.runtime,
-                    f.kind.origin,
-                    f.kind.inlined,
-                )
-            })
+            .map(|f| (&*f.name, f.kind.runtime, f.kind.origin, f.kind.inlined))
             .collect();
         use crate::frame::Origin::{Application as App, Runtime as Rt};
         assert_eq!(

@@ -1,19 +1,24 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::frame::{Frame, FrameKind};
 
-#[derive(Clone, Debug)]
+/// One frame in the call tree. Children are kept heaviest first.
+#[derive(Debug)]
 pub struct FlameNode {
-    pub name: String,
+    /// Shared with the decoded frames and the parent's index: cloning it
+    /// bumps a reference count instead of copying the text.
+    pub name: Arc<str>,
     pub kind: FrameKind,
     pub total_value: i64,
     pub self_value: i64,
     pub children: Vec<FlameNode>,
-    child_index: HashMap<String, usize>,
+    /// Position of each child in `children`, by name.
+    child_index: HashMap<Arc<str>, usize>,
 }
 
 impl FlameNode {
-    pub fn new(name: String, kind: FrameKind) -> Self {
+    pub fn new(name: Arc<str>, kind: FrameKind) -> Self {
         Self {
             name,
             kind,
@@ -46,44 +51,49 @@ impl FlameNode {
         };
         let idx = match self.child_index.get(&frame.name) {
             Some(&idx) => idx,
-            None => {
-                let idx = self.children.len();
-                self.children
-                    .push(FlameNode::new(frame.name.clone(), frame.kind));
-                self.child_index.insert(frame.name.clone(), idx);
-                idx
-            }
+            None => self.push_child(FlameNode::new(Arc::clone(&frame.name), frame.kind)),
         };
         self.children[idx].add_stack(rest, value);
+        self.promote(idx);
     }
 
+    /// Add `other`'s samples to this node, moving any subtrees this node
+    /// lacks instead of copying them.
     pub fn merge(&mut self, other: FlameNode) {
         self.total_value += other.total_value;
         self.self_value += other.self_value;
         for other_child in other.children {
-            if let Some(&idx) = self.child_index.get(&other_child.name) {
-                self.children[idx].merge(other_child);
-            } else {
-                let idx = self.children.len();
-                self.child_index.insert(other_child.name.clone(), idx);
-                self.children.push(other_child);
+            let idx = match self.child_index.get(&other_child.name) {
+                Some(&idx) => {
+                    self.children[idx].merge(other_child);
+                    idx
+                }
+                None => self.push_child(other_child),
+            };
+            self.promote(idx);
+        }
+    }
+
+    fn push_child(&mut self, child: FlameNode) -> usize {
+        let idx = self.children.len();
+        self.child_index.insert(Arc::clone(&child.name), idx);
+        self.children.push(child);
+        idx
+    }
+
+    /// Restore heaviest-first order after the child at `idx` gained weight.
+    /// Weights only grow, so the child can only move toward the front, past
+    /// strictly lighter siblings; equal weights keep their order.
+    fn promote(&mut self, mut idx: usize) {
+        while idx > 0 && self.children[idx].total_value > self.children[idx - 1].total_value {
+            self.children.swap(idx, idx - 1);
+            for i in [idx - 1, idx] {
+                *self
+                    .child_index
+                    .get_mut(&self.children[i].name)
+                    .expect("every child is indexed") = i;
             }
-        }
-    }
-
-    pub fn sort_recursive(&mut self) {
-        self.children
-            .sort_by_key(|c| std::cmp::Reverse(c.total_value));
-        self.rebuild_index();
-        for child in &mut self.children {
-            child.sort_recursive();
-        }
-    }
-
-    fn rebuild_index(&mut self) {
-        self.child_index.clear();
-        for (i, child) in self.children.iter().enumerate() {
-            self.child_index.insert(child.name.clone(), i);
+            idx -= 1;
         }
     }
 
@@ -108,7 +118,7 @@ impl FlameNode {
             .iter()
             .scan(self, |node, &idx| {
                 *node = node.children.get(idx)?;
-                Some(node.name.clone())
+                Some(node.name.to_string())
             })
             .collect()
     }
@@ -121,7 +131,7 @@ impl FlameNode {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct FlameGraph {
     pub root: FlameNode,
 }
@@ -129,11 +139,73 @@ pub struct FlameGraph {
 impl FlameGraph {
     pub fn new() -> Self {
         Self {
-            root: FlameNode::new("all".to_string(), FrameKind::THREAD),
+            root: FlameNode::new("all".into(), FrameKind::THREAD),
         }
     }
 
     pub fn add_stack(&mut self, stack: &[Frame], value: i64) {
         self.root.add_stack(stack, value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(node: &FlameNode) -> Vec<&str> {
+        node.children.iter().map(|c| &*c.name).collect()
+    }
+
+    /// Children must be heaviest first and every index entry must point at
+    /// the child with that name, at every level.
+    fn assert_consistent(node: &FlameNode) {
+        let totals: Vec<i64> = node.children.iter().map(|c| c.total_value).collect();
+        assert!(totals.windows(2).all(|w| w[0] >= w[1]), "{:?}", names(node));
+        assert_eq!(node.child_index.len(), node.children.len());
+        for (i, child) in node.children.iter().enumerate() {
+            assert_eq!(node.child_index[&child.name], i);
+            assert_consistent(child);
+        }
+    }
+
+    #[test]
+    fn a_growing_child_overtakes_lighter_siblings() {
+        let mut graph = FlameGraph::new();
+        for (name, weight) in [("a", 5), ("b", 3), ("c", 1)] {
+            graph.add_stack(&[name.into()], weight);
+        }
+        assert_eq!(names(&graph.root), ["a", "b", "c"]);
+
+        graph.add_stack(&["c".into(), "leaf".into()], 10);
+        assert_eq!(names(&graph.root), ["c", "a", "b"]);
+        assert_eq!(graph.root.child_by_name("c").unwrap().total_value, 11);
+        assert_consistent(&graph.root);
+    }
+
+    #[test]
+    fn equal_weights_keep_arrival_order() {
+        let mut graph = FlameGraph::new();
+        for name in ["x", "y", "z"] {
+            graph.add_stack(&[name.into()], 2);
+        }
+        assert_eq!(names(&graph.root), ["x", "y", "z"]);
+    }
+
+    #[test]
+    fn merge_keeps_order_and_moves_new_subtrees() {
+        let mut live = FlameGraph::new();
+        live.add_stack(&["t".into(), "hot".into()], 10);
+        live.add_stack(&["t".into(), "cold".into()], 1);
+
+        let mut update = FlameGraph::new();
+        update.add_stack(&["t".into(), "cold".into(), "deep".into()], 20);
+        update.add_stack(&["t".into(), "new".into()], 5);
+        live.root.merge(update.root);
+
+        let thread = live.root.child_by_name("t").unwrap();
+        assert_eq!(names(thread), ["cold", "hot", "new"]);
+        assert_eq!(thread.child_by_name("cold").unwrap().total_value, 21);
+        assert_eq!(live.root.total_value, 36);
+        assert_consistent(&live.root);
     }
 }

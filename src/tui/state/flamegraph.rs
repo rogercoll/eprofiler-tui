@@ -60,7 +60,6 @@ impl FlamegraphTab {
             return;
         }
         self.graph.root.merge(new_fg.root);
-        self.graph.root.sort_recursive();
         self.profiles_received += 1;
         self.samples_received += samples;
     }
@@ -102,7 +101,7 @@ impl FlamegraphTab {
     }
 
     fn thread_names(&self) -> impl Iterator<Item = &str> {
-        self.graph.root.children.iter().map(|c| c.name.as_str())
+        self.graph.root.children.iter().map(|c| &*c.name)
     }
 
     fn handle_picker_key(&mut self, key: KeyEvent) {
@@ -111,7 +110,7 @@ impl FlamegraphTab {
         };
         match picker.handle_key(key) {
             Some(PickerEvent::Changed) => {
-                let names = self.graph.root.children.iter().map(|c| c.name.as_str());
+                let names = self.graph.root.children.iter().map(|c| &*c.name);
                 picker.refresh(names);
             }
             Some(PickerEvent::Cancel) => self.picker = None,

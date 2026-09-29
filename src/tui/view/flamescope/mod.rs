@@ -193,7 +193,7 @@ mod tests {
         state.handle_event(Event::ProfileUpdate {
             flamegraph: FlameGraph::new(),
             samples: 0,
-            timestamps: HashMap::from([("t".to_string(), ts)]),
+            timestamps: HashMap::from([("t".into(), ts)]),
         });
         state.active_tab = ActiveTab::Flamescope;
         state

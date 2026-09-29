@@ -100,7 +100,7 @@ mod tests {
         let frames = FlameLayout::new(&fg.root, 100).frames();
         let spans: Vec<_> = frames
             .iter()
-            .map(|f| (f.node.name.as_str(), f.depth, f.x, f.width))
+            .map(|f| (&*f.node.name, f.depth, f.x, f.width))
             .collect();
         assert_eq!(
             spans,
@@ -119,7 +119,7 @@ mod tests {
         let layout = FlameLayout::new(&fg.root, 100);
         let rect = layout.rect_at(&[1]).unwrap();
         assert_eq!(
-            (rect.node.name.as_str(), rect.x, rect.width, rect.depth),
+            (&*rect.node.name, rect.x, rect.width, rect.depth),
             ("b", 75, 25, 1)
         );
         assert!(layout.rect_at(&[5]).is_none());
@@ -131,7 +131,7 @@ mod tests {
         fg.add_stack(&["big".into()], 1000);
         fg.add_stack(&["tiny".into()], 1);
         let layout = FlameLayout::new(&fg.root, 10);
-        assert!(layout.frames().iter().all(|f| f.node.name != "tiny"));
+        assert!(layout.frames().iter().all(|f| &*f.node.name != "tiny"));
         assert_eq!(layout.rect_at(&[1]).unwrap().width, 1);
     }
 }

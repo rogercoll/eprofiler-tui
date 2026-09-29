@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
@@ -85,16 +86,19 @@ impl FlamescopeTab {
         self.cell(col, row) as f64 / self.row_buckets(row).len() as f64
     }
 
-    pub fn record_timestamps(&mut self, entries: &HashMap<String, Vec<u64>>) {
+    pub fn record_timestamps(&mut self, entries: &HashMap<Arc<str>, Vec<u64>>) {
         for (thread, timestamps) in entries {
+            let thread: &str = thread;
+            // Owned copies of the name are made only for threads seen for the first time.
             if !self.threads.contains_key(thread) {
                 let pos = self
                     .thread_names
-                    .binary_search(thread)
+                    .binary_search_by(|name| name.as_str().cmp(thread))
                     .unwrap_or_else(|e| e);
-                self.thread_names.insert(pos, thread.clone());
+                self.thread_names.insert(pos, thread.to_owned());
+                self.threads.insert(thread.to_owned(), Timeline::default());
             }
-            let thread_cols = self.threads.entry(thread.clone()).or_default();
+            let thread_cols = self.threads.get_mut(thread).expect("inserted above");
 
             for &ts in timestamps {
                 let epoch = *self.epoch_ns.get_or_insert(ts);
@@ -254,7 +258,7 @@ mod tests {
 
     fn tab_with(ts: &[u64]) -> FlamescopeTab {
         let mut tab = FlamescopeTab::default();
-        tab.record_timestamps(&HashMap::from([("t".to_string(), ts.to_vec())]));
+        tab.record_timestamps(&HashMap::from([("t".into(), ts.to_vec())]));
         tab
     }
 

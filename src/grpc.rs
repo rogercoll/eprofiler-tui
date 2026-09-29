@@ -209,12 +209,12 @@ mod tests {
                 assert_eq!(samples, 10);
                 assert!(timestamps.is_empty());
                 let thread = &flamegraph.root.children[0];
-                assert_eq!(thread.name, "worker-1");
+                assert_eq!(&*thread.name, "worker-1");
                 assert_eq!(thread.total_value, 10);
                 assert_eq!(thread.kind, FrameKind::THREAD);
-                assert_eq!(thread.children[0].name, "main");
+                assert_eq!(&*thread.children[0].name, "main");
                 assert_eq!(thread.children[0].kind.runtime, Runtime::Unknown);
-                assert_eq!(thread.children[0].children[0].name, "do_work");
+                assert_eq!(&*thread.children[0].children[0].name, "do_work");
             }
             _ => panic!("expected ProfileUpdate event"),
         }
