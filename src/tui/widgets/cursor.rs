@@ -42,24 +42,24 @@ impl Cursor {
     /// Move `offset` the minimum distance so `index` is inside a viewport of
     /// `size` items. Returns the new offset.
     pub fn scroll_to_fit(&mut self, size: usize) -> usize {
-        self.offset = fit_offset(self.offset, self.index, size);
+        self.offset = Self::fit_offset(self.offset, self.index, size);
         self.offset
+    }
+
+    /// Smallest change to `offset` that brings `index` into `offset..offset + size`.
+    fn fit_offset(offset: usize, index: usize, size: usize) -> usize {
+        if size == 0 || index < offset {
+            index.min(offset)
+        } else if index >= offset + size {
+            index + 1 - size
+        } else {
+            offset
+        }
     }
 
     /// Indices shown by a viewport of `size` items over a list of `len`.
     pub fn visible(&self, size: usize, len: usize) -> Range<usize> {
         self.offset..(self.offset + size).min(len)
-    }
-}
-
-/// Smallest change to `offset` that brings `index` into `offset..offset + size`.
-pub fn fit_offset(offset: usize, index: usize, size: usize) -> usize {
-    if size == 0 || index < offset {
-        index.min(offset)
-    } else if index >= offset + size {
-        index + 1 - size
-    } else {
-        offset
     }
 }
 
@@ -92,10 +92,14 @@ mod tests {
 
     #[test]
     fn fit_offset_scrolls_both_ways() {
-        assert_eq!(fit_offset(0, 3, 10), 0, "already visible");
-        assert_eq!(fit_offset(0, 10, 5), 6, "scroll down to show index 10");
-        assert_eq!(fit_offset(6, 2, 5), 2, "scroll up to show index 2");
-        assert_eq!(fit_offset(4, 7, 0), 4, "zero viewport is a no-op");
+        assert_eq!(Cursor::fit_offset(0, 3, 10), 0, "already visible");
+        assert_eq!(
+            Cursor::fit_offset(0, 10, 5),
+            6,
+            "scroll down to show index 10"
+        );
+        assert_eq!(Cursor::fit_offset(6, 2, 5), 2, "scroll up to show index 2");
+        assert_eq!(Cursor::fit_offset(4, 7, 0), 4, "zero viewport is a no-op");
     }
 
     #[test]

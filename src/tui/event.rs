@@ -32,12 +32,12 @@ pub enum Event {
     },
 }
 
-#[allow(dead_code)]
+/// Merges terminal input and a periodic tick into one channel that other
+/// threads can also send to through [`Self::sender`].
 #[derive(Debug)]
 pub struct EventHandler {
     pub sender: mpsc::Sender<Event>,
     receiver: mpsc::Receiver<Event>,
-    handler: thread::JoinHandle<()>,
     running: Arc<AtomicBool>,
 }
 
@@ -47,7 +47,7 @@ impl EventHandler {
         let (sender, receiver) = mpsc::channel();
         let running = Arc::new(AtomicBool::new(true));
 
-        let handler = {
+        {
             let sender = sender.clone();
             let running = running.clone();
             thread::spawn(move || {
@@ -74,13 +74,12 @@ impl EventHandler {
                         last_tick = Instant::now();
                     }
                 }
-            })
-        };
+            });
+        }
 
         Self {
             sender,
             receiver,
-            handler,
             running,
         }
     }

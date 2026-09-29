@@ -12,12 +12,14 @@ use eprofiler_proto::opentelemetry::proto::profiles::v1development as profiles;
 
 use super::DebugState;
 
-use crate::tui::draw::{center, fill, key_hints, popup_frame, truncate};
+use crate::tui::canvas::BufferExt;
+use crate::tui::text::{format_duration, format_hex, format_timestamp, truncate};
 use crate::tui::theme::{
-    ACCENT, ACCENT_LIGHT, ACCENT_PALE, AMBER, BG, BRIGHT, CYAN, DIM, ERROR, FAINT, LIME,
+    ACCENT, ACCENT_LIGHT, ACCENT_PALE, AMBER, BRIGHT, CYAN, DIM, ERROR, FAINT, LIME,
     MATCH_ACTIVE_BG, MATCH_BG, MUTED, MUTED_DARK, ORANGE, POPUP_BORDER, PURPLE, RULE, SUCCESS,
     TEXT, YELLOW,
 };
+use crate::tui::view::KeyHints;
 
 const KEYS: &[(&str, &str)] = &[
     ("[h/←]", " prev "),
@@ -46,24 +48,6 @@ fn fmt_any_val(v: Option<&common::AnyValue>) -> String {
         Some(common::any_value::Value::KvlistValue(kv)) => format!("{{{} pairs}}", kv.values.len()),
         Some(common::any_value::Value::StringValueStrindex(i)) => format!("strindex({i})"),
         None => String::new(),
-    }
-}
-
-fn fmt_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn fmt_timestamp(nanos: u64) -> String {
-    let (secs, ms) = (nanos / 1_000_000_000, (nanos % 1_000_000_000) / 1_000_000);
-    format!("{secs}.{ms:03}s (epoch)")
-}
-
-fn fmt_duration(nanos: u64) -> String {
-    match nanos {
-        n if n >= 1_000_000_000 => format!("{:.3}s", n as f64 / 1e9),
-        n if n >= 1_000_000 => format!("{:.3}ms", n as f64 / 1e6),
-        n if n >= 1_000 => format!("{:.1}µs", n as f64 / 1e3),
-        n => format!("{n}ns"),
     }
 }
 
@@ -370,13 +354,13 @@ impl Doc {
     fn profile(&mut self, p: &profiles::Profile, idx: usize, total: usize, dict: Option<&Dict>) {
         self.section(&format!("Profile {}/{total}", idx + 1));
         if !p.profile_id.is_empty() {
-            self.row(vec![dim("  id: "), fmt_hex(&p.profile_id).fg(PURPLE)]);
+            self.row(vec![dim("  id: "), format_hex(&p.profile_id).fg(PURPLE)]);
         }
         if p.time_unix_nano > 0 {
-            self.kv("  time: ", &fmt_timestamp(p.time_unix_nano));
+            self.kv("  time: ", &format_timestamp(p.time_unix_nano));
         }
         if p.duration_nano > 0 {
-            self.kv("  duration: ", &fmt_duration(p.duration_nano));
+            self.kv("  duration: ", &format_duration(p.duration_nano));
         }
         if let Some(d) = dict {
             for (label, vt) in [
@@ -554,36 +538,31 @@ impl DebugState {
 
     fn render_waiting(&self, frame: &mut Frame, area: Rect) {
         let buf = frame.buffer_mut();
-        let bg = Style::default().bg(BG);
-        fill(buf, area, bg);
+        let text = Style::default();
         let cy = area.y + area.height / 2;
-        center(
-            buf,
+        buf.center(
             area,
             cy.saturating_sub(2),
             "◆ eprofiler-tui debug",
-            bg.fg(ACCENT).add_modifier(Modifier::BOLD),
+            text.fg(ACCENT).add_modifier(Modifier::BOLD),
         );
-        center(
-            buf,
+        buf.center(
             area,
             cy,
             &format!("Listening on {}", self.listen_addr),
-            bg.fg(BRIGHT),
+            text.fg(BRIGHT),
         );
-        center(
-            buf,
+        buf.center(
             area,
             cy + 1,
             "Waiting for profiles...",
-            bg.fg(DIM).add_modifier(Modifier::ITALIC),
+            text.fg(DIM).add_modifier(Modifier::ITALIC),
         );
-        center(
-            buf,
+        buf.center(
             area,
             cy + 3,
             "Send OTLP profiles to inspect them",
-            bg.fg(MUTED_DARK),
+            text.fg(MUTED_DARK),
         );
     }
 
@@ -671,7 +650,7 @@ impl DebugState {
         } else {
             KEYS
         };
-        frame.render_widget(Paragraph::new(key_hints(hints)), area);
+        frame.render_widget(KeyHints(hints), area);
     }
 
     fn render_search_overlay(&self, frame: &mut Frame, area: Rect) {
@@ -689,7 +668,7 @@ impl DebugState {
             ph,
         );
         let buf = frame.buffer_mut();
-        popup_frame(buf, popup, " search ", POPUP_BORDER);
+        buf.popup(popup, " search ", POPUP_BORDER);
         let iw = popup.width.saturating_sub(2) as usize;
         buf.set_string(
             popup.x + 1,

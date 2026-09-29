@@ -5,6 +5,8 @@
 //! name, source file and mapping), never from its position in a graph, so it
 //! is stable across updates and zoom levels.
 
+use std::fmt;
+
 /// Runtime that produced a frame, from the OTLP `profile.frame.type` attribute.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Runtime {
@@ -26,23 +28,6 @@ pub enum Runtime {
 }
 
 impl Runtime {
-    /// Every runtime, in legend order.
-    pub const ALL: [Runtime; 13] = [
-        Self::Native,
-        Self::Kernel,
-        Self::Jvm,
-        Self::Go,
-        Self::Python,
-        Self::Js,
-        Self::Ruby,
-        Self::Php,
-        Self::Dotnet,
-        Self::Beam,
-        Self::Perl,
-        Self::Unknown,
-        Self::Thread,
-    ];
-
     pub fn from_otlp(frame_type: &str) -> Self {
         match frame_type {
             "native" => Self::Native,
@@ -107,11 +92,29 @@ pub struct FrameKind {
 }
 
 impl FrameKind {
-    pub const THREAD: Self = Self {
-        runtime: Runtime::Thread,
-        origin: Origin::Application,
-        inlined: false,
-    };
+    pub const THREAD: Self = Self::new(Runtime::Thread, Origin::Application);
+
+    pub const fn new(runtime: Runtime, origin: Origin) -> Self {
+        Self {
+            runtime,
+            origin,
+            inlined: false,
+        }
+    }
+}
+
+impl fmt::Display for FrameKind {
+    /// `Go · runtime`, `Python · application · inlined`, `Thread`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.runtime.label())?;
+        if !matches!(self.runtime, Runtime::Thread | Runtime::Unknown) {
+            write!(f, " · {}", self.origin.label())?;
+        }
+        if self.inlined {
+            f.write_str(" · inlined")?;
+        }
+        Ok(())
+    }
 }
 
 /// One element of a stack: a label plus what kind of code it is.
@@ -149,86 +152,80 @@ pub struct FrameInfo<'a> {
     pub mapping: Option<&'a str>,
 }
 
-/// Decide whether a frame belongs to the application or to the runtime.
-/// Runtimes without a rule default to application.
-pub fn classify(runtime: Runtime, info: FrameInfo) -> Origin {
-    let is_runtime = match runtime {
-        Runtime::Kernel => true,
-        Runtime::Native => native_is_runtime(info),
-        Runtime::Go => go_is_stdlib(info.function),
-        Runtime::Jvm => has_prefix(
-            info.function,
-            &[
-                "java.", "javax.", "jdk.", "sun.", "com.sun.", "kotlin.", "scala.",
-            ],
-        ),
-        Runtime::Python => info.file.is_some_and(|f| {
-            f.starts_with("<frozen ") || (f.contains("/lib/python") && !is_third_party_dir(f))
-        }),
-        Runtime::Js => info
-            .file
-            .is_some_and(|f| f.starts_with("node:") || f.starts_with("internal/")),
-        Runtime::Ruby => info.file.is_some_and(|f| {
-            f.starts_with("<internal:") || (f.contains("/lib/ruby/") && !f.contains("/gems/"))
-        }),
-        Runtime::Dotnet => has_prefix(info.function, &["System.", "Microsoft."]),
-        _ => false,
-    };
-    if is_runtime {
-        Origin::Runtime
-    } else {
-        Origin::Application
+impl FrameInfo<'_> {
+    const JVM_RUNTIME: &'static [&'static str] = &[
+        "java.", "javax.", "jdk.", "sun.", "com.sun.", "kotlin.", "scala.",
+    ];
+    const DOTNET_RUNTIME: &'static [&'static str] = &["System.", "Microsoft."];
+    const INTERPRETERS: &'static [&'static str] = &[
+        "python", "node", "java", "ruby", "php", "perl", "dotnet", "beam",
+    ];
+    const STD_SYMBOLS: &'static [&'static str] = &[
+        "std::",
+        "core::",
+        "alloc::",
+        "<std::",
+        "<core::",
+        "<alloc::",
+        "__gnu_cxx::",
+    ];
+
+    /// Whether this frame, produced by `runtime`, belongs to the application
+    /// or to the runtime. Runtimes without a rule default to application.
+    pub fn origin(&self, runtime: Runtime) -> Origin {
+        let is_runtime = match runtime {
+            Runtime::Kernel => true,
+            Runtime::Native => self.is_native_runtime(),
+            Runtime::Go => self.is_go_stdlib(),
+            Runtime::Jvm => starts_with_any(self.function, Self::JVM_RUNTIME),
+            Runtime::Dotnet => starts_with_any(self.function, Self::DOTNET_RUNTIME),
+            Runtime::Python => self.file.is_some_and(|f| {
+                let third_party = f.contains("/site-packages/") || f.contains("/dist-packages/");
+                f.starts_with("<frozen ") || (f.contains("/lib/python") && !third_party)
+            }),
+            Runtime::Js => self
+                .file
+                .is_some_and(|f| f.starts_with("node:") || f.starts_with("internal/")),
+            Runtime::Ruby => self.file.is_some_and(|f| {
+                f.starts_with("<internal:") || (f.contains("/lib/ruby/") && !f.contains("/gems/"))
+            }),
+            _ => false,
+        };
+        if is_runtime {
+            Origin::Runtime
+        } else {
+            Origin::Application
+        }
+    }
+
+    /// System libraries, the dynamic loader, the vDSO, interpreter/VM
+    /// binaries, and Rust/C++ standard library symbols.
+    fn is_native_runtime(&self) -> bool {
+        let system_mapping = self.mapping.is_some_and(|m| {
+            (m.starts_with("lib") && m.contains(".so"))
+                || m.starts_with("ld-")
+                || m.contains("vdso")
+                || starts_with_any(m, Self::INTERPRETERS)
+        });
+        system_mapping || starts_with_any(self.function, Self::STD_SYMBOLS)
+    }
+
+    /// Go stdlib import paths have no dot in their first element
+    /// (`net/http`, `runtime`), unlike module paths (`github.com/...`).
+    fn is_go_stdlib(&self) -> bool {
+        let name = self.function.split('[').next().unwrap_or(self.function);
+        let seg_start = name.rfind('/').map_or(0, |i| i + 1);
+        let Some(dot) = name[seg_start..].find('.') else {
+            return false;
+        };
+        let package = &name[..seg_start + dot];
+        let first = package.split('/').next().unwrap_or(package);
+        package != "main" && !first.contains('.')
     }
 }
 
-fn has_prefix(s: &str, prefixes: &[&str]) -> bool {
+fn starts_with_any(s: &str, prefixes: &[&str]) -> bool {
     prefixes.iter().any(|p| s.starts_with(p))
-}
-
-fn is_third_party_dir(path: &str) -> bool {
-    path.contains("/site-packages/") || path.contains("/dist-packages/")
-}
-
-/// System libraries, the dynamic loader, the vDSO, interpreter/VM binaries,
-/// and Rust/C++ standard library symbols.
-fn native_is_runtime(info: FrameInfo) -> bool {
-    let system_mapping = info.mapping.is_some_and(|m| {
-        (m.starts_with("lib") && m.contains(".so"))
-            || m.starts_with("ld-")
-            || m.contains("vdso")
-            || has_prefix(
-                m,
-                &[
-                    "python", "node", "java", "ruby", "php", "perl", "dotnet", "beam",
-                ],
-            )
-    });
-    let std_symbol = has_prefix(
-        info.function,
-        &[
-            "std::",
-            "core::",
-            "alloc::",
-            "<std::",
-            "<core::",
-            "<alloc::",
-            "__gnu_cxx::",
-        ],
-    );
-    system_mapping || std_symbol
-}
-
-/// Go stdlib import paths have no dot in their first element
-/// (`net/http`, `runtime`), unlike module paths (`github.com/...`).
-fn go_is_stdlib(function: &str) -> bool {
-    let name = function.split('[').next().unwrap_or(function);
-    let seg_start = name.rfind('/').map_or(0, |i| i + 1);
-    let Some(dot) = name[seg_start..].find('.') else {
-        return false;
-    };
-    let package = &name[..seg_start + dot];
-    let first = package.split('/').next().unwrap_or(package);
-    package != "main" && !first.contains('.')
 }
 
 #[cfg(test)]
@@ -241,14 +238,12 @@ mod tests {
         file: Option<&str>,
         mapping: Option<&str>,
     ) -> Origin {
-        classify(
-            runtime,
-            FrameInfo {
-                function,
-                file,
-                mapping,
-            },
-        )
+        FrameInfo {
+            function,
+            file,
+            mapping,
+        }
+        .origin(runtime)
     }
 
     #[test]
@@ -373,5 +368,15 @@ mod tests {
         assert_eq!(Runtime::from_otlp("phpjit"), Runtime::Php);
         assert_eq!(Runtime::from_otlp("something-new"), Runtime::Unknown);
         assert_eq!(Runtime::Dotnet.label(), ".NET");
+    }
+
+    #[test]
+    fn kinds_display_runtime_origin_and_inlining() {
+        assert_eq!(FrameKind::THREAD.to_string(), "Thread");
+        let go = FrameKind {
+            inlined: true,
+            ..FrameKind::new(Runtime::Go, Origin::Runtime)
+        };
+        assert_eq!(go.to_string(), "Go · runtime · inlined");
     }
 }

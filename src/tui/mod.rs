@@ -3,18 +3,19 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use state::State;
 use std::{io, panic};
+use view::Screen;
 
 use crate::error::Result;
 
-pub(crate) mod draw;
+pub(crate) mod canvas;
 pub(crate) mod event;
 pub(crate) mod palette;
 pub(crate) mod state;
+pub(crate) mod text;
 pub(crate) mod theme;
 pub(crate) mod widgets;
 
-mod flamescope_layout;
-mod ui;
+pub(crate) mod view;
 
 type Backend = CrosstermBackend<io::Stderr>;
 
@@ -48,7 +49,8 @@ impl Tui {
     }
 
     pub fn draw(&mut self, state: &mut State) -> Result<()> {
-        self.terminal.draw(|frame| ui::render(state, frame))?;
+        self.terminal
+            .draw(|frame| frame.render_stateful_widget(Screen, frame.area(), state))?;
         Ok(())
     }
 

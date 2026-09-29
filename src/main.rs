@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -11,15 +12,21 @@ mod error;
 mod flamegraph;
 mod frame;
 mod grpc;
+mod otlp;
+mod services;
 mod storage;
 mod symbolizer;
 mod tui;
 
-use error::Result;
+use error::{Error, Result};
+use services::Services;
 use storage::SymbolStore;
 use tui::Tui;
-use tui::event::{Event, EventHandler};
-use tui::state::{Action, State};
+use tui::event::EventHandler;
+use tui::state::State;
+
+/// Milliseconds between UI ticks.
+const TICK_RATE_MS: u64 = 100;
 
 #[derive(Parser)]
 #[command(
@@ -47,122 +54,50 @@ enum Commands {
     },
 }
 
+impl Cli {
+    fn listen_addr(&self) -> SocketAddr {
+        SocketAddr::from(([0, 0, 0, 0], self.port))
+    }
+
+    /// The symbol store directory, created if missing.
+    fn storage_path(&self) -> Result<PathBuf> {
+        let path = match &self.data_dir {
+            Some(path) => path.clone(),
+            None => ProjectDirs::from("", "", "eprofiler-tui")
+                .ok_or(Error::NoHomeDir)?
+                .data_local_dir()
+                .to_path_buf(),
+        };
+        std::fs::create_dir_all(&path)?;
+        Ok(path)
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
-
     if let Some(Commands::Debug { port }) = cli.command {
         return debug::run(port.unwrap_or(cli.port));
     }
 
-    let listen_addr = format!("0.0.0.0:{}", cli.port);
-    let storage_path = resolve_storage_path(cli.data_dir)?;
-    let store = Arc::new(SymbolStore::open(&storage_path)?);
-    let events = EventHandler::new(100);
+    let addr = cli.listen_addr();
+    let store = Arc::new(SymbolStore::open(cli.storage_path()?)?);
+    let events = EventHandler::new(TICK_RATE_MS);
+    let services = Services::new(Arc::clone(&store), events.sender.clone());
+    services.serve(addr);
 
-    spawn_grpc_server(
-        Arc::clone(&store),
-        listen_addr.clone(),
-        events.sender.clone(),
+    let mut tui = Tui::new(
+        Terminal::new(CrosstermBackend::new(std::io::stderr()))?,
+        events,
     );
-
-    let backend = CrosstermBackend::new(std::io::stderr());
-    let terminal = Terminal::new(backend)?;
-    let mut tui = Tui::new(terminal, events);
     tui.init()?;
 
-    let mut state = State::new(listen_addr, store.list_files()?);
-
+    let mut state = State::new(addr.to_string(), store.list_files()?);
     while state.running {
         tui.draw(&mut state)?;
-
-        match state.handle_event(tui.events.next()?) {
-            None => {}
-            Some(Action::LoadSymbols(path, target_name)) => {
-                spawn_symbol_load(
-                    Arc::clone(&store),
-                    tui.events.sender.clone(),
-                    path,
-                    target_name,
-                );
-            }
-            Some(Action::RemoveSymbols(name, file_id)) => {
-                state.exe.status = Some(format!("Removing {name}"));
-                spawn_symbol_remove(Arc::clone(&store), tui.events.sender.clone(), name, file_id);
-            }
+        if let Some(action) = state.handle_event(tui.events.next()?) {
+            services.run(action);
         }
     }
 
-    tui.exit()?;
-    Ok(())
-}
-
-fn resolve_storage_path(data_dir: Option<PathBuf>) -> Result<PathBuf> {
-    let path = match data_dir {
-        Some(p) => p,
-        None => ProjectDirs::from("", "", "eprofiler-tui")
-            .expect("Could not determine the user's home directory!")
-            .data_local_dir()
-            .to_path_buf(),
-    };
-    if !path.exists() {
-        std::fs::create_dir_all(&path)
-            .expect("Failed to create the storage directory. Check permissions.");
-    }
-    Ok(path)
-}
-
-fn spawn_grpc_server(
-    store: Arc<SymbolStore>,
-    listen_addr: String,
-    event_tx: std::sync::mpsc::Sender<Event>,
-) {
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-        rt.block_on(async {
-            if let Err(e) = grpc::start_server(event_tx, &listen_addr, store).await {
-                eprintln!("gRPC server error: {e}");
-            }
-        });
-    });
-}
-
-fn spawn_symbol_load(
-    store: Arc<SymbolStore>,
-    sender: std::sync::mpsc::Sender<Event>,
-    path: PathBuf,
-    target_name: Option<String>,
-) {
-    std::thread::spawn(move || {
-        let file_name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string());
-
-        let _ = sender.send(Event::SymbolsLoaded {
-            target_name: target_name.unwrap_or_else(|| file_name.clone()),
-            info: symbolizer::extract_symbols(&path).and_then(|file_sym| {
-                let info = storage::ExecutableInfo {
-                    file_id: file_sym.file_id,
-                    file_name,
-                    num_ranges: file_sym.ranges.len() as u32,
-                };
-                store.store_file_symbols(&file_sym, &path)?;
-                Ok(info)
-            }),
-        });
-    });
-}
-
-fn spawn_symbol_remove(
-    store: Arc<SymbolStore>,
-    sender: std::sync::mpsc::Sender<Event>,
-    name: String,
-    file_id: storage::FileId,
-) {
-    std::thread::spawn(move || {
-        let _ = sender.send(Event::SymbolsRemoved {
-            name,
-            error: store.remove_file_symbols(file_id).err(),
-        });
-    });
+    tui.exit()
 }
