@@ -8,6 +8,7 @@ use crate::error::Result;
 
 pub(crate) mod draw;
 pub(crate) mod event;
+pub(crate) mod palette;
 pub(crate) mod state;
 pub(crate) mod theme;
 pub(crate) mod widgets;

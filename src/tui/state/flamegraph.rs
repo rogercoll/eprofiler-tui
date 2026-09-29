@@ -37,6 +37,8 @@ pub struct FlamegraphTab {
     /// Frame names from the real root down to the zoom root.
     pub zoom_path: Vec<String>,
     pub picker: Option<Picker>,
+    /// Show the color legend overlay.
+    pub show_legend: bool,
 }
 
 impl Default for FlamegraphTab {
@@ -50,6 +52,7 @@ impl Default for FlamegraphTab {
             cursor_path: Vec::new(),
             zoom_path: Vec::new(),
             picker: None,
+            show_legend: false,
         }
     }
 }
@@ -91,6 +94,7 @@ impl FlamegraphTab {
             KeyCode::Esc | KeyCode::Backspace => self.zoom_out(),
             KeyCode::Char('r') => self.reset(),
             KeyCode::Char('/') => self.open_search(),
+            KeyCode::Char('?') => self.show_legend = !self.show_legend,
             _ => {}
         };
     }
@@ -188,6 +192,7 @@ impl FlamegraphTab {
     fn reset(&mut self) {
         *self = Self {
             frozen: self.frozen,
+            show_legend: self.show_legend,
             ..Self::default()
         };
     }

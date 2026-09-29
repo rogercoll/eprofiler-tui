@@ -3,6 +3,7 @@ use std::sync::{Arc, RwLock, mpsc};
 use tonic::{Request, Response, Status};
 
 use crate::flamegraph::FlameGraph;
+use crate::frame::{Frame, FrameInfo, FrameKind, Runtime, classify};
 use crate::storage::SymbolStore;
 use crate::tui::event::Event;
 use eprofiler_proto::opentelemetry::proto::collector::profiles::v1development as collector;
@@ -44,12 +45,21 @@ impl<'a> Dict<'a> {
     }
 
     fn func_name(&self, line: &profiles::Line) -> &'a str {
+        self.function(line)
+            .and_then(|f| self.str(f.name_strindex))
+            .unwrap_or("[unknown]")
+    }
+
+    fn func_file(&self, line: &profiles::Line) -> Option<&'a str> {
+        self.function(line)
+            .and_then(|f| self.str(f.filename_strindex))
+    }
+
+    fn function(&self, line: &profiles::Line) -> Option<&'a profiles::Function> {
         self.d
             .function_table
             .get(line.function_index as usize)
             .filter(|_| line.function_index > 0)
-            .and_then(|f| self.str(f.name_strindex))
-            .unwrap_or("[unknown]")
     }
 
     fn mapping_basename(&self, location: &profiles::Location) -> &'a str {
@@ -62,23 +72,9 @@ impl<'a> Dict<'a> {
             .unwrap_or("[unknown]")
     }
 
-    fn frame_type(&self, location: &profiles::Location) -> &str {
+    fn runtime(&self, location: &profiles::Location) -> Runtime {
         self.find_attr_value(&location.attribute_indices, "profile.frame.type")
-            .map(|s| match s {
-                "native" => "Native",
-                "kernel" => "Kernel",
-                "jvm" => "JVM",
-                "cpython" => "Python",
-                "php" | "phpjit" => "PHP",
-                "ruby" => "Ruby",
-                "perl" => "Perl",
-                "v8js" => "JS",
-                "dotnet" => ".NET",
-                "beam" => "Beam",
-                "go" => "Go",
-                other => other,
-            })
-            .unwrap_or("Unknown")
+            .map_or(Runtime::Unknown, Runtime::from_otlp)
     }
 
     fn thread_name(&self, sample: &profiles::Sample) -> &'a str {
@@ -125,42 +121,47 @@ impl<'a> Dict<'a> {
     }
 }
 
-/// Pre-resolves the location table into human-readable strings.
-fn pre_resolve_locations(dict: &Dict, store: &SymbolStore) -> Vec<String> {
+/// Pre-resolves the location table into labeled, classified frames.
+///
+/// A location with several lines (or several symbolized inline levels) is an
+/// inline chain; it becomes one frame whose label joins the functions with
+/// ` / ` and whose kind is classified from the first function.
+fn pre_resolve_locations(dict: &Dict, store: &SymbolStore) -> Vec<Frame> {
     dict.d
         .location_table
         .iter()
         .map(|location| {
-            let tag = dict.frame_type(location);
-            if location.lines.is_empty() {
-                if tag == "Native"
-                    && let Some(names) = symbolize_native(store, location, dict)
-                {
-                    return names
-                        .iter()
-                        .enumerate()
-                        .map(|(i, n)| {
-                            format!("{n} [Native]{}", if i > 0 { " [Inline]" } else { "" })
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" / ");
-                }
-                let basename = dict.mapping_basename(location);
-                format!("{basename}+0x{:016x} [{tag}]", location.address)
-            } else {
-                location
+            let runtime = dict.runtime(location);
+            let mapping = dict.mapping_basename(location);
+
+            let (names, file): (Vec<String>, Option<&str>) = if !location.lines.is_empty() {
+                let names = location
                     .lines
                     .iter()
-                    .enumerate()
-                    .map(|(i, line)| {
-                        format!(
-                            "{} [{tag}]{}",
-                            dict.func_name(line),
-                            if i > 0 { " [Inline]" } else { "" }
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" / ")
+                    .map(|l| dict.func_name(l).to_owned())
+                    .collect();
+                (names, dict.func_file(&location.lines[0]))
+            } else if runtime == Runtime::Native
+                && let Some(names) = symbolize_native(store, location, dict)
+            {
+                (names, None)
+            } else {
+                (vec![format!("{mapping}+0x{:016x}", location.address)], None)
+            };
+
+            let info = FrameInfo {
+                function: &names[0],
+                file,
+                mapping: Some(mapping),
+            };
+            let kind = FrameKind {
+                runtime,
+                origin: classify(runtime, info),
+                inlined: names.len() > 1,
+            };
+            Frame {
+                name: names.join(" / "),
+                kind,
             }
         })
         .collect()
@@ -178,7 +179,7 @@ fn process_export(
     let dict = Dict::new(raw_dict);
 
     let mut flamegraph = FlameGraph::new();
-    let mut stack_cache: HashMap<i32, Vec<String>> = HashMap::new();
+    let mut stack_cache: HashMap<i32, Vec<Frame>> = HashMap::new();
     let location_cache = pre_resolve_locations(&dict, store);
     let mut sample_count: u64 = 0;
     let mut thread_timestamps: HashMap<String, Vec<u64>> = HashMap::new();
@@ -197,14 +198,14 @@ fn process_export(
                 return Vec::new();
             }
 
-            let mut frames: Vec<String> = dict.d.stack_table[idx]
+            let mut frames: Vec<Frame> = dict.d.stack_table[idx]
                 .location_indices
                 .iter()
                 .filter_map(|&loc_idx| location_cache.get(loc_idx as usize).cloned())
                 .collect();
             frames.reverse();
 
-            let comm = dict.thread_name(sample).to_string();
+            let comm = Frame::thread(dict.thread_name(sample));
             let mut result = Vec::with_capacity(frames.len() + 1);
             result.push(comm);
             result.extend(frames);
@@ -217,7 +218,7 @@ fn process_export(
 
         let value = if !sample.timestamps_unix_nano.is_empty() {
             thread_timestamps
-                .entry(stack[0].clone())
+                .entry(stack[0].name.clone())
                 .or_default()
                 .extend_from_slice(&sample.timestamps_unix_nano);
             sample.timestamps_unix_nano.len() as i64
@@ -435,8 +436,10 @@ mod tests {
                 let thread = &flamegraph.root.children[0];
                 assert_eq!(thread.name, "worker-1");
                 assert_eq!(thread.total_value, 10);
-                assert_eq!(thread.children[0].name, "main [Unknown]");
-                assert_eq!(thread.children[0].children[0].name, "do_work [Unknown]");
+                assert_eq!(thread.kind, FrameKind::THREAD);
+                assert_eq!(thread.children[0].name, "main");
+                assert_eq!(thread.children[0].kind.runtime, Runtime::Unknown);
+                assert_eq!(thread.children[0].children[0].name, "do_work");
             }
             _ => panic!("expected ProfileUpdate event"),
         }
@@ -491,5 +494,86 @@ mod tests {
             }
             _ => panic!("expected ProfileUpdate event"),
         }
+    }
+
+    #[test]
+    fn locations_resolve_to_classified_frames() {
+        let attr = |key: i32, value: &str| KeyValueAndUnit {
+            key_strindex: key,
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(value.into())),
+            }),
+            unit_strindex: 0,
+        };
+        let func = |name: i32| Function {
+            name_strindex: name,
+            ..Default::default()
+        };
+        let line = |function_index: i32| Line {
+            function_index,
+            ..Default::default()
+        };
+        let dict = ProfilesDictionary {
+            string_table: vec![
+                "".into(),
+                "profile.frame.type".into(),
+                "main.work".into(),
+                "runtime.mallocgc".into(),
+                "/usr/lib/x86_64-linux-gnu/libc.so.6".into(),
+            ],
+            attribute_table: vec![KeyValueAndUnit::default(), attr(1, "go"), attr(1, "native")],
+            function_table: vec![Function::default(), func(2), func(3)],
+            mapping_table: vec![
+                profiles::Mapping::default(),
+                profiles::Mapping {
+                    filename_strindex: 4,
+                    ..Default::default()
+                },
+            ],
+            location_table: vec![
+                Location::default(),
+                Location {
+                    lines: vec![line(1)],
+                    attribute_indices: vec![1],
+                    ..Default::default()
+                },
+                Location {
+                    lines: vec![line(2), line(1)],
+                    attribute_indices: vec![1],
+                    ..Default::default()
+                },
+                Location {
+                    mapping_index: 1,
+                    address: 0x1234,
+                    attribute_indices: vec![2],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SymbolStore::open(tmp.path()).unwrap();
+
+        let frames = pre_resolve_locations(&Dict::new(&dict), &store);
+        let kinds: Vec<_> = frames[1..]
+            .iter()
+            .map(|f| {
+                (
+                    f.name.as_str(),
+                    f.kind.runtime,
+                    f.kind.origin,
+                    f.kind.inlined,
+                )
+            })
+            .collect();
+        use crate::frame::Origin::{Application as App, Runtime as Rt};
+        assert_eq!(
+            kinds,
+            vec![
+                ("main.work", Runtime::Go, App, false),
+                ("runtime.mallocgc / main.work", Runtime::Go, Rt, true),
+                ("libc.so.6+0x0000000000001234", Runtime::Native, Rt, false),
+            ]
+        );
     }
 }

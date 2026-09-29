@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 
+use crate::frame::{Frame, FrameKind};
+
 #[derive(Clone, Debug)]
 pub struct FlameNode {
     pub name: String,
+    pub kind: FrameKind,
     pub total_value: i64,
     pub self_value: i64,
     pub children: Vec<FlameNode>,
@@ -10,9 +13,10 @@ pub struct FlameNode {
 }
 
 impl FlameNode {
-    pub fn new(name: String) -> Self {
+    pub fn new(name: String, kind: FrameKind) -> Self {
         Self {
             name,
+            kind,
             total_value: 0,
             self_value: 0,
             children: Vec::new(),
@@ -25,26 +29,32 @@ impl FlameNode {
         self.child_index.get(name).map(|&idx| &self.children[idx])
     }
 
-    /// O(1) positional index of a child by name.
-    pub fn child_position(&self, name: &str) -> Option<usize> {
-        self.child_index.get(name).copied()
+    /// Share of this node's time spent in itself rather than in callees.
+    pub fn self_ratio(&self) -> f64 {
+        if self.total_value > 0 {
+            self.self_value as f64 / self.total_value as f64
+        } else {
+            0.0
+        }
     }
 
-    pub fn add_stack(&mut self, stack: &[String], value: i64) {
+    pub fn add_stack(&mut self, stack: &[Frame], value: i64) {
         self.total_value += value;
-        if stack.is_empty() {
+        let Some((frame, rest)) = stack.split_first() else {
             self.self_value += value;
             return;
-        }
-        let idx = if let Some(&idx) = self.child_index.get(&stack[0]) {
-            idx
-        } else {
-            let idx = self.children.len();
-            self.children.push(FlameNode::new(stack[0].clone()));
-            self.child_index.insert(stack[0].clone(), idx);
-            idx
         };
-        self.children[idx].add_stack(&stack[1..], value);
+        let idx = match self.child_index.get(&frame.name) {
+            Some(&idx) => idx,
+            None => {
+                let idx = self.children.len();
+                self.children
+                    .push(FlameNode::new(frame.name.clone(), frame.kind));
+                self.child_index.insert(frame.name.clone(), idx);
+                idx
+            }
+        };
+        self.children[idx].add_stack(rest, value);
     }
 
     pub fn merge(&mut self, other: FlameNode) {
@@ -97,15 +107,6 @@ impl FlameNode {
             .iter()
             .try_fold(self, |node, &idx| node.children.get(idx))
     }
-
-    #[allow(dead_code)]
-    pub fn max_depth(&self) -> usize {
-        self.children
-            .iter()
-            .map(|c| c.max_depth())
-            .max()
-            .map_or(0, |d| d + 1)
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -116,117 +117,90 @@ pub struct FlameGraph {
 impl FlameGraph {
     pub fn new() -> Self {
         Self {
-            root: FlameNode::new("all".to_string()),
+            root: FlameNode::new("all".to_string(), FrameKind::THREAD),
         }
     }
 
-    pub fn add_stack(&mut self, stack: &[String], value: i64) {
+    pub fn add_stack(&mut self, stack: &[Frame], value: i64) {
         self.root.add_stack(stack, value);
     }
 }
 
-pub struct FrameRect {
+/// A node placed on screen: horizontal extent in cells and its depth row.
+pub struct FrameRect<'a> {
     pub x: u16,
     pub width: u16,
     pub depth: usize,
-    pub name: String,
-    pub self_value: i64,
-    pub total_value: i64,
-    pub palette_index: usize,
+    pub node: &'a FlameNode,
 }
 
-pub fn layout_frames(
-    node: &FlameNode,
-    area_width: u16,
-    forced_palette: Option<usize>,
-) -> Vec<FrameRect> {
-    if node.total_value <= 0 {
+/// Place every node under `root` that is at least one cell wide.
+pub fn layout_frames(root: &FlameNode, area_width: u16) -> Vec<FrameRect<'_>> {
+    if root.total_value <= 0 {
         return Vec::new();
     }
-    let scale = area_width as f64 / node.total_value as f64;
+    let scale = area_width as f64 / root.total_value as f64;
     let mut frames = Vec::new();
-    layout_recursive(node, 0.0, 0, scale, forced_palette, &mut frames);
+    layout_recursive(root, 0.0, 0, scale, &mut frames);
     frames
 }
 
-fn layout_recursive(
-    node: &FlameNode,
+fn layout_recursive<'a>(
+    node: &'a FlameNode,
     x_float: f64,
     depth: usize,
     scale: f64,
-    palette: Option<usize>,
-    frames: &mut Vec<FrameRect>,
+    frames: &mut Vec<FrameRect<'a>>,
 ) {
     let x_end = x_float + node.total_value as f64 * scale;
     let x = x_float.round() as u16;
     let width = (x_end.round() as u16).saturating_sub(x);
-
     if width == 0 {
         return;
     }
-
-    let palette_index = palette.unwrap_or(0);
-
     frames.push(FrameRect {
         x,
         width,
         depth,
-        name: node.name.clone(),
-        self_value: node.self_value,
-        total_value: node.total_value,
-        palette_index,
+        node,
     });
 
     let mut child_x = x_float;
-    for (i, child) in node.children.iter().enumerate() {
-        let child_palette = Some(if depth == 0 && palette.is_none() {
-            i
-        } else {
-            palette_index
-        });
-        layout_recursive(child, child_x, depth + 1, scale, child_palette, frames);
+    for child in &node.children {
+        layout_recursive(child, child_x, depth + 1, scale, frames);
         child_x += child.total_value as f64 * scale;
     }
 }
 
-pub fn cursor_frame_rect(
-    zoom_root: &FlameNode,
+/// Screen extent of the node at `cursor_path` below `root`, even if it is
+/// narrower than one cell.
+pub fn cursor_frame_rect<'a>(
+    root: &'a FlameNode,
     cursor_path: &[usize],
     area_width: u16,
-    forced_palette: Option<usize>,
-) -> Option<FrameRect> {
-    if zoom_root.total_value <= 0 {
+) -> Option<FrameRect<'a>> {
+    if root.total_value <= 0 {
         return None;
     }
-    let scale = area_width as f64 / zoom_root.total_value as f64;
-    let mut node = zoom_root;
+    let scale = area_width as f64 / root.total_value as f64;
+    let mut node = root;
     let mut x_acc = 0.0;
-    let mut palette_index = forced_palette.unwrap_or(0);
 
-    for (step, &idx) in cursor_path.iter().enumerate() {
-        for i in 0..idx.min(node.children.len()) {
-            x_acc += node.children[i].total_value as f64 * scale;
-        }
-        if idx < node.children.len() {
-            if step == 0 && forced_palette.is_none() {
-                palette_index = idx;
-            }
-            node = &node.children[idx];
-        } else {
-            return None;
-        }
+    for &idx in cursor_path {
+        let preceding: i64 = node
+            .children
+            .get(..idx)?
+            .iter()
+            .map(|c| c.total_value)
+            .sum();
+        x_acc += preceding as f64 * scale;
+        node = node.children.get(idx)?;
     }
 
-    let x = x_acc.round() as u16;
-    let width = (node.total_value as f64 * scale).round().max(1.0) as u16;
-
     Some(FrameRect {
-        x,
-        width,
+        x: x_acc.round() as u16,
+        width: (node.total_value as f64 * scale).round().max(1.0) as u16,
         depth: cursor_path.len(),
-        name: node.name.clone(),
-        self_value: node.self_value,
-        total_value: node.total_value,
-        palette_index,
+        node,
     })
 }

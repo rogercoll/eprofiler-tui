@@ -9,10 +9,12 @@ use ratatui::{
 
 use super::draw::{self, center, fill, format_count, hline, truncate};
 use super::flamescope_layout::FlamescopeLayout;
+use super::palette::{self, frame_color};
 use super::state::{ActiveTab, ExecutablesTab, FlamegraphTab, FlamescopeTab, State};
 use super::theme::{self, Gradient, blend, bold, contrast_fg, darken, gradient, italic, lighten};
 use super::widgets::fit_offset;
 use crate::flamegraph::{cursor_frame_rect, layout_frames};
+use crate::frame::{FrameKind, Origin, Runtime};
 
 pub fn render(state: &mut State, frame: &mut Frame) {
     let area = frame.area();
@@ -39,6 +41,9 @@ pub fn render(state: &mut State, frame: &mut Frame) {
         ActiveTab::Flamegraph => {
             render_detail_bar(&state.fg, frame, detail);
             render_flamegraph(&mut state.fg, frame, body);
+            if state.fg.show_legend {
+                render_legend(frame.buffer_mut(), body);
+            }
         }
         ActiveTab::Flamescope => {
             render_flamescope_detail_bar(&state.fs, frame, detail);
@@ -234,15 +239,20 @@ fn render_detail_bar(fg: &FlamegraphTab, frame: &mut Frame, area: Rect) {
         };
         let stat = |v: i64| format!("{} ({:.1}%)", format_count(v as u64), pct(v));
 
+        let node = sel.node;
+        let swatch = frame_color(node.kind, &node.name, node.self_ratio());
         spans.extend([
             " ▸ ".fg(theme::ACCENT).bold(),
-            truncate(&sel.node.name, 40).fg(theme::BRIGHT).bold(),
+            truncate(&node.name, 40).fg(theme::BRIGHT).bold(),
+            sep(),
+            "■ ".fg(swatch),
+            kind_label(node.kind).fg(theme::MUTED),
             sep(),
             "self: ".fg(theme::DIM),
-            stat(sel.node.self_value).fg(theme::ORANGE),
+            stat(node.self_value).fg(theme::ORANGE),
             sep(),
             "total: ".fg(theme::DIM),
-            stat(sel.node.total_value).fg(theme::WARNING),
+            stat(node.total_value).fg(theme::WARNING),
             sep(),
             "depth: ".fg(theme::DIM),
             sel.depth.to_string().fg(theme::MUTED),
@@ -266,12 +276,7 @@ fn render_flamegraph(fg: &mut FlamegraphTab, frame: &mut Frame, area: Rect) {
         return;
     }
 
-    let forced_palette = fg
-        .zoom_path
-        .first()
-        .and_then(|name| fg.graph.root.child_position(name));
-
-    let frames = layout_frames(zoom_root, area.width, forced_palette);
+    let frames = layout_frames(zoom_root, area.width);
     let max_depth = frames.iter().map(|f| f.depth).max().unwrap_or(0);
     let viewport = area.height as usize;
     let root_total = zoom_root.total_value;
@@ -281,7 +286,7 @@ fn render_flamegraph(fg: &mut FlamegraphTab, frame: &mut Frame, area: Rect) {
         .min(max_depth.saturating_sub(viewport.saturating_sub(1)));
     let scroll_y = fg.scroll_y;
 
-    let cursor_rect = cursor_frame_rect(zoom_root, &fg.cursor_path, area.width, forced_palette);
+    let cursor_rect = cursor_frame_rect(zoom_root, &fg.cursor_path, area.width);
 
     for fr in frames
         .iter()
@@ -292,12 +297,8 @@ fn render_flamegraph(fg: &mut FlamegraphTab, frame: &mut Frame, area: Rect) {
             .as_ref()
             .is_some_and(|cr| cr.depth == fr.depth && cr.x == fr.x);
 
-        let heat = if fr.total_value > 0 {
-            fr.self_value as f64 / fr.total_value as f64
-        } else {
-            0.0
-        };
-        let mut bg = flame_color(&fr.name, heat, fr.palette_index);
+        let node = fr.node;
+        let mut bg = frame_color(node.kind, &node.name, node.self_ratio());
         if is_cursor {
             bg = lighten(bg, 45);
         }
@@ -319,7 +320,7 @@ fn render_flamegraph(fg: &mut FlamegraphTab, frame: &mut Frame, area: Rect) {
 
         let inner_width = fr.width.saturating_sub(2) as usize;
         if inner_width >= 3 {
-            let name = truncate(&fr.name, inner_width);
+            let name = truncate(&node.name, inner_width);
             let pad = inner_width.saturating_sub(name.chars().count()) / 2;
             let mut style = Style::default().fg(fg_color).bg(bg);
             if is_cursor {
@@ -329,7 +330,7 @@ fn render_flamegraph(fg: &mut FlamegraphTab, frame: &mut Frame, area: Rect) {
         }
 
         if fr.width >= 14 && root_total > 0 {
-            let pct = fr.total_value as f64 / root_total as f64 * 100.0;
+            let pct = node.total_value as f64 / root_total as f64 * 100.0;
             let pct_str = format!("{pct:.1}%");
             let pct_x = x_start + fr.width - pct_str.len() as u16 - 2;
             if pct >= 0.1 && pct_x > x_start + 2 {
@@ -366,6 +367,60 @@ fn render_flamegraph(fg: &mut FlamegraphTab, frame: &mut Frame, area: Rect) {
                 Style::default().fg(theme::GHOST),
             );
         }
+    }
+}
+
+/// "Go · runtime", "Python · application · inlined", "Thread".
+fn kind_label(kind: FrameKind) -> String {
+    let mut label = kind.runtime.label().to_owned();
+    if !matches!(kind.runtime, Runtime::Thread | Runtime::Unknown) {
+        label.push_str(" · ");
+        label.push_str(kind.origin.label());
+    }
+    if kind.inlined {
+        label.push_str(" · inlined");
+    }
+    label
+}
+
+/// Runtime color key, anchored to the top-right corner of `area`.
+fn render_legend(buf: &mut Buffer, area: Rect) {
+    const NOTES: [&str; 2] = ["brighter = more self time", "lighter = inlined"];
+    let runtimes = Runtime::ALL.iter().filter(|r| **r != Runtime::Thread);
+    let rows = runtimes.clone().count() as u16;
+    let (w, h) = (32, rows + NOTES.len() as u16 + 5);
+    if area.width < w + 2 || area.height < h {
+        return;
+    }
+    let popup = Rect::new(area.right() - w - 1, area.y, w, h);
+    draw::popup_frame(buf, popup, " colors ", theme::ACCENT);
+
+    let x = popup.x + 2;
+    let header = Style::reset().fg(theme::DIM).add_modifier(Modifier::ITALIC);
+    buf.set_string(x, popup.y + 1, "app runtime", header);
+
+    let swatch = |c: Color| Style::reset().bg(c);
+    for (i, &runtime) in runtimes.enumerate() {
+        let y = popup.y + 2 + i as u16;
+        buf.set_string(
+            x,
+            y,
+            "   ",
+            swatch(palette::swatch(runtime, Origin::Application)),
+        );
+        if runtime != Runtime::Unknown {
+            buf.set_string(
+                x + 4,
+                y,
+                "   ",
+                swatch(palette::swatch(runtime, Origin::Runtime)),
+            );
+        }
+        buf.set_string(x + 12, y, runtime.label(), Style::reset().fg(theme::TEXT));
+    }
+    for (i, note) in NOTES.iter().enumerate() {
+        let y = popup.y + 3 + rows + i as u16;
+        buf.set_string(x, y, note, Style::reset().fg(theme::MUTED));
     }
 }
 
@@ -615,6 +670,7 @@ const FLAMEGRAPH_KEYS: &[(&str, &str)] = &[
     ("[Enter]", " zoom "),
     ("[Esc]", " back "),
     ("[/]", " search "),
+    ("[?]", " colors "),
     ("[r]", " reset "),
 ];
 
@@ -644,97 +700,6 @@ fn tab_keys(tab: ActiveTab) -> &'static [(&'static str, &'static str)] {
         ActiveTab::Flamescope => FLAMESCOPE_KEYS,
         ActiveTab::Executables => EXE_KEYS,
     }
-}
-
-// ---------------------------------------------------------------------------
-// Flame colors
-// ---------------------------------------------------------------------------
-
-const PALETTES: &[&Gradient] = &[
-    &[
-        (0.00, (253, 224, 71)),
-        (0.25, (251, 191, 36)),
-        (0.45, (249, 115, 22)),
-        (0.65, (234, 88, 12)),
-        (0.80, (220, 38, 38)),
-        (1.00, (185, 28, 28)),
-    ],
-    &[
-        (0.00, (252, 211, 77)),
-        (0.25, (245, 158, 11)),
-        (0.45, (217, 119, 6)),
-        (0.65, (180, 83, 9)),
-        (0.80, (146, 64, 14)),
-        (1.00, (120, 53, 15)),
-    ],
-    &[
-        (0.00, (253, 164, 175)),
-        (0.25, (251, 113, 133)),
-        (0.45, (244, 63, 94)),
-        (0.65, (225, 29, 72)),
-        (0.80, (190, 18, 60)),
-        (1.00, (136, 19, 55)),
-    ],
-    &[
-        (0.00, (190, 242, 100)),
-        (0.25, (163, 230, 53)),
-        (0.45, (132, 204, 22)),
-        (0.65, (101, 163, 13)),
-        (0.80, (77, 124, 15)),
-        (1.00, (54, 83, 20)),
-    ],
-    &[
-        (0.00, (153, 246, 228)),
-        (0.25, (94, 234, 212)),
-        (0.45, (20, 184, 166)),
-        (0.65, (13, 148, 136)),
-        (0.80, (15, 118, 110)),
-        (1.00, (19, 78, 74)),
-    ],
-    &[
-        (0.00, (147, 197, 253)),
-        (0.25, (96, 165, 250)),
-        (0.45, (59, 130, 246)),
-        (0.65, (37, 99, 235)),
-        (0.80, (29, 78, 216)),
-        (1.00, (30, 58, 138)),
-    ],
-    &[
-        (0.00, (165, 180, 252)),
-        (0.25, (129, 140, 248)),
-        (0.45, (99, 102, 241)),
-        (0.65, (79, 70, 229)),
-        (0.80, (67, 56, 202)),
-        (1.00, (55, 48, 163)),
-    ],
-    &[
-        (0.00, (216, 180, 254)),
-        (0.25, (192, 132, 252)),
-        (0.45, (168, 85, 247)),
-        (0.65, (147, 51, 234)),
-        (0.80, (126, 34, 206)),
-        (1.00, (88, 28, 135)),
-    ],
-];
-
-/// Palette color for `heat` (self/total ratio), jittered per frame name so
-/// adjacent frames with equal heat stay distinguishable.
-fn flame_color(name: &str, heat: f64, palette_index: usize) -> Color {
-    let hash = name.bytes().fold(0u64, |h, b| {
-        h.wrapping_mul(2654435761).wrapping_add(b as u64)
-    });
-
-    let stops = PALETTES[palette_index % PALETTES.len()];
-    let (r, g, b) = gradient(heat, stops);
-
-    let rv = ((hash % 18) as i16 - 9).clamp(-12, 12);
-    let gv = (((hash >> 5) % 14) as i16 - 7).clamp(-10, 10);
-
-    Color::Rgb(
-        (r as i16 + rv).clamp(25, 255) as u8,
-        (g as i16 + gv).clamp(20, 255) as u8,
-        b,
-    )
 }
 
 #[cfg(test)]
@@ -824,5 +789,77 @@ mod tests {
         let screen = draw(&mut state, 100, 20);
         assert!(screen.contains("libc.so.6"), "{screen}");
         assert!(screen.contains("▸ libc.so.6"), "{screen}");
+    }
+
+    /// Background of the rendered cell inside the frame at `path`, where
+    /// `path` is relative to the current zoom root.
+    fn bg_of(state: &mut State, path: &[&str]) -> Color {
+        let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        term.draw(|f| render(state, f)).unwrap();
+        let root = state.fg.zoom_root();
+        let names: Vec<String> = path.iter().map(|s| s.to_string()).collect();
+        let target = root.follow_path(&names);
+        let fr = layout_frames(root, 100)
+            .into_iter()
+            .find(|f| std::ptr::eq(f.node, target))
+            .expect("frame is laid out");
+        // Header and detail bar sit above the graph.
+        let y = 2 + (fr.depth - state.fg.scroll_y) as u16;
+        term.backend().buffer()[(fr.x + 1, y)].bg
+    }
+
+    #[test]
+    fn frame_colors_survive_reorder_and_zoom() {
+        let mut state = populated_state();
+        let before = bg_of(&mut state, &["worker-2", "main"]);
+
+        // worker-2 overtakes worker-1, flipping the top-level order.
+        let mut fg = FlameGraph::new();
+        fg.add_stack(&["worker-2".into(), "other".into()], 100);
+        state.handle_event(Event::ProfileUpdate {
+            flamegraph: fg,
+            samples: 100,
+            timestamps: HashMap::new(),
+        });
+        assert_eq!(state.fg.graph.root.children[0].name, "worker-2");
+        assert_eq!(bg_of(&mut state, &["worker-2", "main"]), before);
+
+        state.fg.zoom_path = vec!["worker-2".into()];
+        assert_eq!(bg_of(&mut state, &["main"]), before);
+    }
+
+    #[test]
+    fn legend_toggles_and_lists_runtimes() {
+        let mut state = populated_state();
+        assert!(!draw(&mut state, 100, 30).contains("brighter = more self time"));
+        state.handle_event(key(KeyCode::Char('?')));
+        let screen = draw(&mut state, 100, 30);
+        for label in [
+            "colors",
+            "Native",
+            "Python",
+            ".NET",
+            "brighter = more self time",
+        ] {
+            assert!(screen.contains(label), "missing {label}: {screen}");
+        }
+        state.handle_event(key(KeyCode::Char('?')));
+        assert!(!draw(&mut state, 100, 30).contains("brighter = more self time"));
+    }
+
+    #[test]
+    fn detail_bar_shows_frame_kind() {
+        assert_eq!(kind_label(FrameKind::THREAD), "Thread");
+        let go_runtime = FrameKind {
+            runtime: Runtime::Go,
+            origin: Origin::Runtime,
+            inlined: true,
+        };
+        assert_eq!(kind_label(go_runtime), "Go · runtime · inlined");
+
+        let mut state = populated_state();
+        state.handle_event(key(KeyCode::Down));
+        let screen = draw(&mut state, 120, 20);
+        assert!(screen.contains("■ Unknown"), "{screen}");
     }
 }
