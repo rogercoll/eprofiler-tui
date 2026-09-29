@@ -183,7 +183,7 @@ mod tests {
         type_str(&mut state, "WORK");
         state.handle_event(key(KeyCode::Enter));
         assert!(state.fg.picker.is_none());
-        assert_eq!(state.fg.zoom_path, vec!["worker-1".to_string()]);
+        assert_eq!(&*state.fg.zoom_root().name, "worker-1");
     }
 
     #[test]
@@ -238,5 +238,41 @@ mod tests {
         );
         assert!(matches!(state.server_error, Some(Error::Bind { .. })));
         assert!(state.running, "the UI keeps running");
+    }
+
+    #[test]
+    fn flamegraph_navigation_stays_inside_the_zoomed_subtree() {
+        let mut state = populated_state();
+        let name = |state: &State| state.fg.selected().node.name.to_string();
+        let press = |state: &mut State, code| {
+            state.handle_event(key(code));
+        };
+
+        // At the zoom root, up, left and right have nowhere to go.
+        for code in [KeyCode::Up, KeyCode::Left, KeyCode::Right] {
+            press(&mut state, code);
+            assert_eq!(name(&state), "all");
+        }
+        press(&mut state, KeyCode::Down);
+        assert_eq!(name(&state), "worker-1");
+        press(&mut state, KeyCode::Left);
+        assert_eq!(name(&state), "worker-1", "no sibling before the first");
+        press(&mut state, KeyCode::Right);
+        press(&mut state, KeyCode::Right);
+        assert_eq!(name(&state), "other", "no sibling after the last");
+
+        // Zooming makes the selection the new root; up cannot leave it.
+        press(&mut state, KeyCode::Enter);
+        assert_eq!(&*state.fg.zoom_root().name, "other");
+        press(&mut state, KeyCode::Down);
+        assert_eq!(name(&state), "main");
+        assert_eq!(state.fg.selected().depth, 1);
+        press(&mut state, KeyCode::Up);
+        press(&mut state, KeyCode::Up);
+        assert_eq!(name(&state), "other");
+
+        press(&mut state, KeyCode::Esc);
+        assert_eq!(&*state.fg.zoom_root().name, "all");
+        assert_eq!(name(&state), "all");
     }
 }

@@ -12,6 +12,7 @@ use ratatui::{
 
 use super::TabView;
 use super::chrome::{DetailLine, Keys, Placeholder};
+use crate::flamegraph::FlameGraph;
 use crate::tui::canvas::BufferExt;
 use crate::tui::state::FlamegraphTab;
 use crate::tui::text::{format_count, truncate};
@@ -36,21 +37,20 @@ impl TabView for FlamegraphTab {
         if area.width < 4 || area.height < 2 {
             return;
         }
-        // Borrow fields, not `self.zoom_root()`, so `scroll_y` stays assignable.
-        let root = self.graph.root.follow_path(&self.zoom_path);
-        if root.total_value <= 0 {
+        let root_total = self.graph[self.zoom].total_value;
+        if root_total <= 0 {
             Placeholder("No profile data yet").render(area, buf);
             return;
         }
 
-        let layout = FlameLayout::new(root, area.width);
+        let layout = FlameLayout::new(&self.graph, self.zoom, area.width);
         let frames = layout.frames();
         let max_depth = frames.iter().map(|f| f.depth).max().unwrap_or(0);
         let viewport = area.height as usize;
 
         // Keep the cursor's depth on screen without scrolling past the deepest row.
         let mut depth = Cursor {
-            index: self.cursor_path.len(),
+            index: self.cursor_depth(),
             offset: self.scroll_y,
         };
         self.scroll_y = depth
@@ -60,14 +60,10 @@ impl TabView for FlamegraphTab {
         let painter = Painter {
             area,
             scroll_y: self.scroll_y,
-            root_total: root.total_value,
+            root_total,
         };
-        let cursor = layout.rect_at(&self.cursor_path);
         for frame in &frames {
-            let is_cursor = cursor
-                .as_ref()
-                .is_some_and(|c| c.depth == frame.depth && c.x == frame.x);
-            painter.frame(buf, frame, is_cursor);
+            painter.frame(buf, frame, frame.id == self.cursor);
         }
         for depth in painter.rows().filter(|&d| d <= max_depth) {
             if !frames.iter().any(|f| f.depth == depth) {
@@ -78,12 +74,11 @@ impl TabView for FlamegraphTab {
 
     fn detail(&self) -> Line<'static> {
         let mut line = DetailLine::default();
-        if let Some(zoomed) = self.zoom_path.last() {
+        if self.zoom != FlameGraph::ROOT {
+            let zoomed = &self.zoom_root().name;
             line = line.group([format!(" zoomed: {zoomed} ").fg(theme::ACCENT).bold()]);
         }
-        let Some(selected) = self.selected() else {
-            return line.into();
-        };
+        let selected = self.selected();
 
         let node = selected.node;
         let root_total = self.zoom_root().total_value.max(1) as f64;
@@ -200,13 +195,14 @@ mod tests {
     /// `path` is relative to the current zoom root.
     fn bg_of(state: &mut State, path: &[&str]) -> Color {
         let buf = render(state, 100, 20);
-        let root = state.fg.zoom_root();
-        let names: Vec<String> = path.iter().map(|s| s.to_string()).collect();
-        let target = root.follow_path(&names);
-        let frame = FlameLayout::new(root, 100)
+        let fg = &state.fg;
+        let target = path.iter().fold(fg.zoom, |id, name| {
+            fg.graph.child(id, name).expect("child exists")
+        });
+        let frame = FlameLayout::new(&fg.graph, fg.zoom, 100)
             .frames()
             .into_iter()
-            .find(|f| std::ptr::eq(f.node, target))
+            .find(|f| f.id == target)
             .expect("frame is laid out");
         // Header and detail bar sit above the graph.
         let y = 2 + (frame.depth - state.fg.scroll_y) as u16;
@@ -224,11 +220,36 @@ mod tests {
             samples: 100,
             timestamps: HashMap::new(),
         });
-        assert_eq!(&*state.fg.graph.root.children[0].name, "worker-2");
+        let graph = &state.fg.graph;
+        assert_eq!(
+            &*graph[graph[FlameGraph::ROOT].children[0]].name,
+            "worker-2"
+        );
         assert_eq!(bg_of(&mut state, &["worker-2", "main"]), before);
 
-        state.fg.zoom_path = vec!["worker-2".into()];
+        let worker_2 = state.fg.graph.child(FlameGraph::ROOT, "worker-2").unwrap();
+        state.fg.zoom = worker_2;
+        state.fg.cursor = worker_2;
         assert_eq!(bg_of(&mut state, &["main"]), before);
+    }
+
+    #[test]
+    fn cursor_stays_on_its_frame_when_siblings_reorder() {
+        let mut state = populated_state();
+        // Select worker-2, the second thread from the left.
+        state.handle_event(key(KeyCode::Down));
+        state.handle_event(key(KeyCode::Right));
+        assert_eq!(&*state.fg.selected().node.name, "worker-2");
+
+        // worker-2 overtakes worker-1 and moves to the front.
+        state.handle_event(Event::ProfileUpdate {
+            stacks: vec![SampledStack::from_names(&["worker-2", "other"], 100)],
+            samples: 100,
+            timestamps: HashMap::new(),
+        });
+        assert_eq!(state.fg.selected().node.position(), 0);
+        assert_eq!(&*state.fg.selected().node.name, "worker-2");
+        assert!(screen(&mut state, 100, 20).contains("▸ worker-2"));
     }
 
     #[test]
