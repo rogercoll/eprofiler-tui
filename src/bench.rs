@@ -23,7 +23,7 @@ use eprofiler_proto::opentelemetry::proto::profiles::v1development::{
 };
 use ratatui::{Terminal, backend::TestBackend};
 
-use crate::flamegraph::FlameNode;
+use crate::flamegraph::FlameGraph;
 use crate::otlp::{Decoder, KnownMappings};
 use crate::storage::SymbolStore;
 use crate::tui::event::Event;
@@ -122,8 +122,8 @@ impl Report {
             report.merge += time;
             report.merge_heap += heap;
         }
-        report.nodes = count_nodes(&state.fg.graph.root);
-        assert_heaviest_first(&state.fg.graph.root);
+        report.nodes = state.fg.graph.nodes().len();
+        assert_heaviest_first(&state.fg.graph);
 
         let mut term = Terminal::new(TestBackend::new(SCREEN.0, SCREEN.1)).unwrap();
         let ((), time, heap) = measure(|| {
@@ -138,15 +138,12 @@ impl Report {
     }
 }
 
-fn count_nodes(node: &FlameNode) -> usize {
-    1 + node.children.iter().map(count_nodes).sum::<usize>()
-}
-
-/// Guards against a faster merge that stops keeping siblings in order.
-fn assert_heaviest_first(node: &FlameNode) {
-    let totals = node.children.iter().map(|c| c.total_value);
-    assert!(totals.clone().zip(totals.skip(1)).all(|(a, b)| a >= b));
-    node.children.iter().for_each(assert_heaviest_first);
+/// Guards against a faster insert that stops keeping siblings in order.
+fn assert_heaviest_first(graph: &FlameGraph) {
+    for node in graph.nodes() {
+        let totals = node.children.iter().map(|&c| graph[c].total_value);
+        assert!(totals.clone().zip(totals.skip(1)).all(|(a, b)| a >= b));
+    }
 }
 
 /// Run `f`, returning its result, elapsed time and heap allocations.

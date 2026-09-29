@@ -20,6 +20,7 @@ use ratatui::{
 };
 
 use super::state::{ActiveTab, State};
+use crate::flamegraph::FlameGraph;
 use chrome::Header;
 use waiting::Waiting;
 
@@ -30,7 +31,9 @@ impl StatefulWidget for Screen {
     type State = State;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut State) {
-        if state.active_tab == ActiveTab::Flamegraph && state.fg.graph.root.total_value == 0 {
+        if state.active_tab == ActiveTab::Flamegraph
+            && state.fg.graph[FlameGraph::ROOT].total_value == 0
+        {
             Waiting {
                 listen_addr: &state.listen_addr,
                 error: state.server_error.as_ref(),

@@ -1,6 +1,6 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
-use crate::flamegraph::{FlameGraph, FlameNode, SampledStack};
+use crate::flamegraph::{FlameGraph, FlameNode, NodeId, SampledStack};
 use crate::tui::theme;
 use crate::tui::widgets::{Picker, PickerEvent, PickerStyle};
 
@@ -22,6 +22,7 @@ pub static THREAD_PICKER: PickerStyle = PickerStyle {
 /// The frame under the cursor, derived from the graph on demand.
 pub struct Selected<'a> {
     pub node: &'a FlameNode,
+    /// Steps below the zoom root.
     pub depth: usize,
 }
 
@@ -32,10 +33,11 @@ pub struct FlamegraphTab {
     pub samples_received: u64,
     /// First visible depth row.
     pub scroll_y: usize,
-    /// Child indices from the zoom root down to the cursor.
-    pub cursor_path: Vec<usize>,
-    /// Frame names from the real root down to the zoom root.
-    pub zoom_path: Vec<String>,
+    /// Top of the visible subtree.
+    pub zoom: NodeId,
+    /// Selected frame; always in the zoom root's subtree. Node ids are stable,
+    /// so the selection stays on its frame when updates reorder siblings.
+    pub cursor: NodeId,
     pub picker: Option<Picker>,
 }
 
@@ -47,8 +49,8 @@ impl Default for FlamegraphTab {
             profiles_received: 0,
             samples_received: 0,
             scroll_y: 0,
-            cursor_path: Vec::new(),
-            zoom_path: Vec::new(),
+            zoom: FlameGraph::ROOT,
+            cursor: FlameGraph::ROOT,
             picker: None,
         }
     }
@@ -68,15 +70,19 @@ impl FlamegraphTab {
     }
 
     pub fn zoom_root(&self) -> &FlameNode {
-        self.graph.root.follow_path(&self.zoom_path)
+        &self.graph[self.zoom]
     }
 
-    pub fn selected(&self) -> Option<Selected<'_>> {
-        let node = self.zoom_root().descend(&self.cursor_path)?;
-        Some(Selected {
-            node,
-            depth: self.cursor_path.len(),
-        })
+    pub fn selected(&self) -> Selected<'_> {
+        Selected {
+            node: &self.graph[self.cursor],
+            depth: self.cursor_depth(),
+        }
+    }
+
+    /// Steps from the zoom root down to the cursor.
+    pub fn cursor_depth(&self) -> usize {
+        self.graph.depth(self.cursor, self.zoom).unwrap_or(0)
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) {
@@ -87,8 +93,8 @@ impl FlamegraphTab {
             KeyCode::Char('f') | KeyCode::Char(' ') => self.frozen = !self.frozen,
             KeyCode::Down | KeyCode::Char('j') => self.move_down(),
             KeyCode::Up | KeyCode::Char('k') => self.move_up(),
-            KeyCode::Left | KeyCode::Char('h') => self.move_left(),
-            KeyCode::Right | KeyCode::Char('l') => self.move_right(),
+            KeyCode::Left | KeyCode::Char('h') => self.move_sideways(-1),
+            KeyCode::Right | KeyCode::Char('l') => self.move_sideways(1),
             KeyCode::Enter => self.zoom_in(),
             KeyCode::Esc | KeyCode::Backspace => self.zoom_out(),
             KeyCode::Char('r') => self.reset(),
@@ -104,7 +110,8 @@ impl FlamegraphTab {
     }
 
     fn thread_names(&self) -> impl Iterator<Item = &str> {
-        self.graph.root.children.iter().map(|c| &*c.name)
+        let root = &self.graph[FlameGraph::ROOT];
+        root.children.iter().map(|&t| &*self.graph[t].name)
     }
 
     fn handle_picker_key(&mut self, key: KeyEvent) {
@@ -113,77 +120,72 @@ impl FlamegraphTab {
         };
         match picker.handle_key(key) {
             Some(PickerEvent::Changed) => {
-                let names = self.graph.root.children.iter().map(|c| &*c.name);
-                picker.refresh(names);
+                let root = &self.graph[FlameGraph::ROOT];
+                picker.refresh(root.children.iter().map(|&t| &*self.graph[t].name));
             }
             Some(PickerEvent::Cancel) => self.picker = None,
             Some(PickerEvent::Submit) => {
-                let picked = self
-                    .picker
-                    .take()
-                    .and_then(|p| p.selected().map(str::to_owned));
-                if let Some(name) = picked {
-                    self.zoom_path = vec![name];
-                    self.reset_cursor();
+                let picked = self.picker.take();
+                let thread = picked
+                    .as_ref()
+                    .and_then(|p| p.selected())
+                    .and_then(|name| self.graph.child(FlameGraph::ROOT, name));
+                if let Some(thread) = thread {
+                    self.zoom_to(thread);
                 }
             }
             None => {}
         }
     }
 
-    fn cursor_node(&self) -> &FlameNode {
-        self.zoom_root().follow_indices(&self.cursor_path)
-    }
-
     fn move_down(&mut self) {
-        if !self.cursor_node().children.is_empty() {
-            self.cursor_path.push(0);
+        if let Some(&first) = self.graph[self.cursor].children.first() {
+            self.cursor = first;
         }
     }
 
     fn move_up(&mut self) {
-        self.cursor_path.pop();
-    }
-
-    fn move_left(&mut self) {
-        if let Some(last) = self.cursor_path.last_mut() {
-            *last = last.saturating_sub(1);
+        if self.cursor != self.zoom
+            && let Some(parent) = self.graph[self.cursor].parent
+        {
+            self.cursor = parent;
         }
     }
 
-    fn move_right(&mut self) {
-        let Some(depth) = self.cursor_path.len().checked_sub(1) else {
+    /// Move to the previous (`-1`) or next (`1`) sibling, if there is one.
+    fn move_sideways(&mut self, step: isize) {
+        if self.cursor == self.zoom {
+            return;
+        }
+        let node = &self.graph[self.cursor];
+        let Some(parent) = node.parent else {
             return;
         };
-        let siblings = self
-            .zoom_root()
-            .follow_indices(&self.cursor_path[..depth])
-            .children
-            .len();
-        if let Some(last) = self.cursor_path.last_mut()
-            && *last + 1 < siblings
+        let siblings = &self.graph[parent].children;
+        if let Some(&sibling) = node
+            .position()
+            .checked_add_signed(step)
+            .and_then(|pos| siblings.get(pos))
         {
-            *last += 1;
+            self.cursor = sibling;
         }
     }
 
     fn zoom_in(&mut self) {
-        if self.cursor_path.is_empty() {
-            return;
+        if self.cursor != self.zoom {
+            self.zoom_to(self.cursor);
         }
-        let names = self.zoom_root().names_along(&self.cursor_path);
-        self.zoom_path.extend(names);
-        self.reset_cursor();
     }
 
     fn zoom_out(&mut self) {
-        if self.zoom_path.pop().is_some() {
-            self.reset_cursor();
+        if let Some(parent) = self.graph[self.zoom].parent {
+            self.zoom_to(parent);
         }
     }
 
-    fn reset_cursor(&mut self) {
-        self.cursor_path.clear();
+    fn zoom_to(&mut self, id: NodeId) {
+        self.zoom = id;
+        self.cursor = id;
         self.scroll_y = 0;
     }
 
