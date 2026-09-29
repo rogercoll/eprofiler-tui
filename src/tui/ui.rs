@@ -1,21 +1,18 @@
 use ratatui::{
     Frame,
     buffer::Buffer,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::Paragraph,
 };
 
+use super::draw::{self, center, fill, format_count, hline, truncate};
 use super::flamescope_layout::FlamescopeLayout;
-use super::state::{ActiveTab, ExecutablesTab, FlamegraphTab, FlamescopeTab, SearchOverlay, State};
+use super::state::{ActiveTab, ExecutablesTab, FlamegraphTab, FlamescopeTab, State};
+use super::theme::{self, Gradient, blend, bold, contrast_fg, darken, gradient, italic, lighten};
+use super::widgets::fit_offset;
 use crate::flamegraph::{cursor_frame_rect, layout_frames};
-
-const BG: Color = Color::Rgb(16, 16, 22);
-const ACCENT: Color = Color::Rgb(59, 130, 246);
-const DIM: Color = Color::Rgb(70, 70, 85);
-const BRIGHT: Color = Color::Rgb(220, 220, 235);
-const SEP_COLOR: Color = Color::Rgb(35, 35, 45);
 
 pub fn render(state: &mut State, frame: &mut Frame) {
     let area = frame.area();
@@ -25,7 +22,7 @@ pub fn render(state: &mut State, frame: &mut Frame) {
         return;
     }
 
-    let chunks = Layout::new(
+    let [header, detail, body, footer] = Layout::new(
         Direction::Vertical,
         [
             Constraint::Length(1),
@@ -34,301 +31,200 @@ pub fn render(state: &mut State, frame: &mut Frame) {
             Constraint::Length(1),
         ],
     )
-    .split(area);
+    .areas(area);
 
-    render_header(state, frame, chunks[0]);
+    render_header(state, frame, header);
 
     match state.active_tab {
         ActiveTab::Flamegraph => {
-            render_detail_bar(&state.fg, frame, chunks[1]);
-            render_flamegraph(&mut state.fg, frame, chunks[2]);
-            render_keyhints(
-                state.fg.search.active,
-                FLAMEGRAPH_KEYS,
-                SEARCH_KEYS,
-                frame,
-                chunks[3],
-            );
-            if state.fg.search.active {
-                render_search_overlay(&state.fg.search, frame, chunks[2]);
-            }
+            render_detail_bar(&state.fg, frame, detail);
+            render_flamegraph(&mut state.fg, frame, body);
         }
         ActiveTab::Flamescope => {
-            render_flamescope_detail_bar(&state.fs, frame, chunks[1]);
-            render_flamescope(&mut state.fs, frame, chunks[2]);
-            render_keyhints(
-                state.fs.search.active,
-                FLAMESCOPE_KEYS,
-                SEARCH_KEYS,
-                frame,
-                chunks[3],
-            );
-            if state.fs.search.active {
-                render_search_overlay(&state.fs.search, frame, chunks[2]);
-            }
+            render_flamescope_detail_bar(&state.fs, frame, detail);
+            render_flamescope(&state.fs, frame, body);
         }
         ActiveTab::Executables => {
-            render_exe_status_bar(state.exe.status.as_deref(), frame, chunks[1]);
-            render_exe_table(&mut state.exe, frame, chunks[2]);
-            render_keyhints(
-                state.exe.path_input.active,
-                EXE_KEYS,
-                EXE_INPUT_KEYS,
-                frame,
-                chunks[3],
-            );
-            if state.exe.path_input.active {
-                let pi = &state.exe.path_input;
-                let items: Vec<&str> = pi.completions.iter().map(String::as_str).collect();
-                render_overlay(
-                    frame,
-                    chunks[2],
-                    &OverlayProps {
-                        title: " executable path ",
-                        input: &pi.input,
-                        items: &items,
-                        cursor: pi.completion_cursor,
-                        border_color: ACCENT,
-                        max_visible: 5,
-                        empty_hint: if pi.input.is_empty() {
-                            "type a path..."
-                        } else {
-                            "no matches"
-                        },
-                        popup_width: 60,
-                    },
-                );
-            }
+            render_exe_status_bar(state.exe.status.as_deref(), frame, detail);
+            render_exe_table(&mut state.exe, frame, body);
         }
     }
+
+    let hints = state
+        .active_picker()
+        .map_or(tab_keys(state.active_tab), |p| p.style.keys);
+    frame.render_widget(Paragraph::new(draw::key_hints(hints)), footer);
+
+    if let Some(picker) = state.active_picker() {
+        frame.render_widget(picker, body);
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Waiting screen
+// ---------------------------------------------------------------------------
+
+const LOGO: &[&str] = &[
+    " ███████╗██████╗ ██████╗  ██████╗ ███████╗██╗██╗     ███████╗██████╗       ████████╗██╗   ██╗██╗",
+    " ██╔════╝██╔══██╗██╔══██╗██╔═══██╗██╔════╝██║██║     ██╔════╝██╔══██╗      ╚══██╔══╝██║   ██║██║",
+    " █████╗  ██████╔╝██████╔╝██║   ██║█████╗  ██║██║     █████╗  ██████╔╝█████╗   ██║   ██║   ██║██║",
+    " ██╔══╝  ██╔═══╝ ██╔══██╗██║   ██║██╔══╝  ██║██║     ██╔══╝  ██╔══██╗╚════╝   ██║   ██║   ██║██║",
+    " ███████╗██║     ██║  ██║╚██████╔╝██║     ██║███████╗███████╗██║  ██║         ██║   ╚██████╔╝██║",
+    " ╚══════╝╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝     ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝         ╚═╝    ╚═════╝ ╚═╝",
+];
+
+const LOGO_GRADIENT: &[Color] = &[
+    Color::Rgb(168, 50, 160),
+    Color::Rgb(200, 40, 80),
+    Color::Rgb(220, 50, 32),
+    Color::Rgb(240, 100, 18),
+    Color::Rgb(250, 170, 30),
+    theme::YELLOW,
+];
 
 fn render_waiting(frame: &mut Frame, area: Rect, listen_addr: &str) {
     let buf = frame.buffer_mut();
-    fill(buf, area, BG);
+    let on_bg = |style: Style| style.bg(theme::BG);
+    fill(buf, area, on_bg(Style::reset()));
 
-    let art: &[&str] = &[
-        " ███████╗██████╗ ██████╗  ██████╗ ███████╗██╗██╗     ███████╗██████╗       ████████╗██╗   ██╗██╗",
-        " ██╔════╝██╔══██╗██╔══██╗██╔═══██╗██╔════╝██║██║     ██╔════╝██╔══██╗      ╚══██╔══╝██║   ██║██║",
-        " █████╗  ██████╔╝██████╔╝██║   ██║█████╗  ██║██║     █████╗  ██████╔╝█████╗   ██║   ██║   ██║██║",
-        " ██╔══╝  ██╔═══╝ ██╔══██╗██║   ██║██╔══╝  ██║██║     ██╔══╝  ██╔══██╗╚════╝   ██║   ██║   ██║██║",
-        " ███████╗██║     ██║  ██║╚██████╔╝██║     ██║███████╗███████╗██║  ██║         ██║   ╚██████╔╝██║",
-        " ╚══════╝╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝     ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝         ╚═╝    ╚═════╝ ╚═╝",
-    ];
-
-    let art_h = art.len() as u16;
-    let art_w = art.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
-
-    let subtitle = "OTLP Profile Flamegraph Viewer";
-    let listening = format!("Listening on {listen_addr}");
-    let waiting = "Waiting for profiles...";
-
+    let art_h = LOGO.len() as u16;
+    let art_w = LOGO.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
     let total_h = art_h + 5;
-    let v_off = area.height.saturating_sub(total_h) / 2;
-
-    let flame_gradient: &[Color] = &[
-        Color::Rgb(168, 50, 160),
-        Color::Rgb(200, 40, 80),
-        Color::Rgb(220, 50, 32),
-        Color::Rgb(240, 100, 18),
-        Color::Rgb(250, 170, 30),
-        Color::Rgb(253, 224, 71),
-    ];
+    let top = area.y + area.height.saturating_sub(total_h) / 2;
 
     if area.width >= art_w + 2 && area.height >= total_h {
-        let h_off = (area.width.saturating_sub(art_w)) / 2;
-        for (i, line) in art.iter().enumerate() {
-            let color = flame_gradient[i % flame_gradient.len()];
-            buf.set_string(
-                area.x + h_off,
-                area.y + v_off + i as u16,
-                line,
-                Style::default().fg(color).bg(BG),
-            );
+        let x = area.x + area.width.saturating_sub(art_w) / 2;
+        for (i, line) in LOGO.iter().enumerate() {
+            let color = LOGO_GRADIENT[i % LOGO_GRADIENT.len()];
+            buf.set_string(x, top + i as u16, line, on_bg(Style::default().fg(color)));
         }
     } else {
-        let name = "◆ eprofiler-tui";
-        let hx = area.x + (area.width.saturating_sub(name.len() as u16)) / 2;
-        buf.set_string(
-            hx,
-            area.y + v_off + 1,
-            name,
-            Style::default()
-                .fg(Color::Rgb(250, 170, 30))
-                .bg(BG)
-                .add_modifier(Modifier::BOLD),
+        center(
+            buf,
+            area,
+            top + 1,
+            "◆ eprofiler-tui",
+            on_bg(bold(LOGO_GRADIENT[4])),
         );
     }
 
-    let base_y = area.y + v_off + art_h + 1;
-
-    center_str(
+    let subtitle = "OTLP Profile Flamegraph Viewer";
+    let base_y = top + art_h + 1;
+    center(buf, area, base_y, subtitle, on_bg(bold(theme::BRIGHT)));
+    let rule_w = subtitle.len() as u16;
+    let rule_x = area.x + area.width.saturating_sub(rule_w) / 2;
+    hline(
         buf,
-        area,
-        base_y,
-        subtitle,
-        Style::default()
-            .fg(BRIGHT)
-            .bg(BG)
-            .add_modifier(Modifier::BOLD),
-    );
-
-    let sep_len = subtitle.len() as u16;
-    let sep_x = area.x + (area.width.saturating_sub(sep_len)) / 2;
-    buf.set_string(
-        sep_x,
         base_y + 1,
-        "─".repeat(sep_len as usize),
-        Style::default().fg(SEP_COLOR).bg(BG),
+        rule_x,
+        rule_x + rule_w,
+        '─',
+        on_bg(Style::default().fg(theme::RULE)),
     );
-
-    center_str(
+    center(
         buf,
         area,
         base_y + 2,
-        &listening,
-        Style::default().fg(Color::Rgb(130, 130, 150)).bg(BG),
+        &format!("Listening on {listen_addr}"),
+        on_bg(Style::default().fg(theme::MUTED)),
     );
-    center_str(
+    center(
         buf,
         area,
         base_y + 3,
-        waiting,
-        Style::default()
-            .fg(DIM)
-            .bg(BG)
-            .add_modifier(Modifier::ITALIC),
+        "Waiting for profiles...",
+        on_bg(italic(theme::DIM)),
     );
 }
 
-fn center_str(buf: &mut Buffer, area: Rect, y: u16, text: &str, style: Style) {
-    if y >= area.y + area.height {
-        return;
-    }
-    let x = area.x + (area.width.saturating_sub(text.len() as u16)) / 2;
-    buf.set_string(x, y, text, style);
+// ---------------------------------------------------------------------------
+// Header
+// ---------------------------------------------------------------------------
+
+const TABS: &[(&str, ActiveTab)] = &[
+    ("Flamegraph", ActiveTab::Flamegraph),
+    ("Flamescope", ActiveTab::Flamescope),
+    ("Executables", ActiveTab::Executables),
+];
+
+fn sep() -> Span<'static> {
+    " │ ".fg(theme::FAINT)
 }
 
 fn render_header(state: &State, frame: &mut Frame, area: Rect) {
-    let sep = " │ ".fg(Color::Rgb(55, 55, 65));
-
-    let left_spans: Vec<Span> = vec![
-        Span::styled(" ◆ ", Style::default().fg(ACCENT)),
-        Span::styled(
-            "eprofiler-tui",
-            Style::default().fg(BRIGHT).add_modifier(Modifier::BOLD),
-        ),
-        sep.clone(),
-        Span::styled(
-            state.listen_addr.clone(),
-            Style::default().fg(Color::Rgb(130, 130, 150)),
-        ),
-        sep.clone(),
-        format!("{} profiles", state.fg.profiles_received).fg(Color::Rgb(110, 110, 130)),
-        sep,
-        format!("{} samples", format_count(state.fg.samples_received))
-            .fg(Color::Rgb(110, 110, 130)),
-    ];
-    frame.render_widget(Paragraph::new(Line::from(left_spans)), area);
+    let left = Line::from(vec![
+        " ◆ ".fg(theme::ACCENT),
+        "eprofiler-tui".fg(theme::BRIGHT).bold(),
+        sep(),
+        state.listen_addr.clone().fg(theme::MUTED),
+        sep(),
+        format!("{} profiles", state.fg.profiles_received).fg(theme::MUTED_DARK),
+        sep(),
+        format!("{} samples", format_count(state.fg.samples_received)).fg(theme::MUTED_DARK),
+    ]);
+    frame.render_widget(Paragraph::new(left), area);
 
     let buf = frame.buffer_mut();
 
-    let (icon, label, status_color) = if state.fg.frozen {
-        ("⏸ ", "FROZEN", Color::Rgb(234, 179, 8))
+    let (indicator, color) = if state.fg.frozen {
+        (" ⏸ FROZEN ", theme::WARNING)
     } else {
-        ("▶ ", "LIVE", Color::Rgb(34, 197, 94))
+        (" ▶ LIVE ", theme::SUCCESS)
     };
-    let indicator = format!(" {icon}{label} ");
-    let indicator_len = indicator.len() as u16;
-    let ix = area.x + area.width.saturating_sub(indicator_len);
-    buf.set_string(
-        ix,
-        area.y,
-        &indicator,
-        Style::default()
-            .fg(status_color)
-            .add_modifier(Modifier::BOLD),
-    );
+    let indicator_x = area
+        .right()
+        .saturating_sub(indicator.chars().count() as u16);
+    buf.set_string(indicator_x, area.y, indicator, bold(color));
 
-    let active_style = Style::default().fg(BRIGHT).add_modifier(Modifier::BOLD);
-    let inactive_style = Style::default().fg(DIM);
+    // Right-aligned tab strip, just left of the indicator. Widths are in
+    // columns, not bytes: the separator glyph is multi-byte.
     let tab_sep = " │ ";
-    let sep_style = Style::default().fg(Color::Rgb(55, 55, 65));
-
-    let tabs: &[(&str, ActiveTab)] = &[
-        ("Flamegraph", ActiveTab::Flamegraph),
-        ("Flamescope", ActiveTab::Flamescope),
-        ("Executables", ActiveTab::Executables),
-    ];
-    let tabs_width: usize =
-        tabs.iter().map(|(l, _)| l.len()).sum::<usize>() + tab_sep.len() * (tabs.len() - 1) + 2;
-    let tabs_x = ix.saturating_sub(tabs_width as u16);
-
-    buf.set_string(tabs_x, area.y, " ", Style::default());
-    let mut x = tabs_x + 1;
-    for (i, &(label, tab)) in tabs.iter().enumerate() {
+    let sep_w = tab_sep.chars().count() as u16;
+    let tabs_width: u16 =
+        TABS.iter().map(|(l, _)| l.len() as u16).sum::<u16>() + sep_w * (TABS.len() as u16 - 1) + 2;
+    let mut x = indicator_x.saturating_sub(tabs_width) + 1;
+    for (i, &(label, tab)) in TABS.iter().enumerate() {
         if i > 0 {
-            buf.set_string(x, area.y, tab_sep, sep_style);
-            x += tab_sep.len() as u16;
+            buf.set_string(x, area.y, tab_sep, Style::default().fg(theme::FAINT));
+            x += sep_w;
         }
         let style = if state.active_tab == tab {
-            active_style
+            bold(theme::BRIGHT)
         } else {
-            inactive_style
+            Style::default().fg(theme::DIM)
         };
         buf.set_string(x, area.y, label, style);
         x += label.len() as u16;
     }
 }
 
-fn render_search_overlay(search: &SearchOverlay, frame: &mut Frame, area: Rect) {
-    let items: Vec<&str> = search.matches.iter().map(String::as_str).collect();
-    render_overlay(
-        frame,
+/// Centered, italic placeholder for views with nothing to show yet.
+fn render_empty(buf: &mut Buffer, area: Rect, msg: &str) {
+    center(
+        buf,
         area,
-        &OverlayProps {
-            title: " thread.name ",
-            input: &search.input,
-            items: &items,
-            cursor: search.cursor,
-            border_color: Color::Rgb(245, 166, 35),
-            max_visible: 3,
-            empty_hint: if search.input.is_empty() {
-                "type to filter threads..."
-            } else {
-                "no matches"
-            },
-            popup_width: 50,
-        },
+        area.y + area.height / 2,
+        msg,
+        italic(theme::SUBTLE),
     );
 }
 
+// ---------------------------------------------------------------------------
+// Flamegraph
+// ---------------------------------------------------------------------------
+
 fn render_detail_bar(fg: &FlamegraphTab, frame: &mut Frame, area: Rect) {
-    let sel = &fg.selection;
-    if sel.name.is_empty() && fg.zoom_path.is_empty() {
-        return;
-    }
-
-    let sep = " │ ".fg(Color::Rgb(55, 55, 65));
-    let root_total = fg.graph.root.follow_path(&fg.zoom_path).total_value;
-
     let mut spans: Vec<Span> = Vec::new();
 
-    if !fg.zoom_path.is_empty() {
-        spans.push(
-            format!(
-                " zoomed: {} ",
-                fg.zoom_path.last().unwrap_or(&String::new())
-            )
-            .fg(ACCENT)
-            .bold(),
-        );
-        if !sel.name.is_empty() {
-            spans.push(sep.clone());
-        }
+    if let Some(zoomed) = fg.zoom_path.last() {
+        spans.push(format!(" zoomed: {zoomed} ").fg(theme::ACCENT).bold());
     }
 
-    if !sel.name.is_empty() {
+    if let Some(sel) = fg.selected() {
+        if !spans.is_empty() {
+            spans.push(sep());
+        }
+        let root_total = fg.zoom_root().total_value;
         let pct = |v: i64| {
             if root_total > 0 {
                 v as f64 / root_total as f64 * 100.0
@@ -336,35 +232,21 @@ fn render_detail_bar(fg: &FlamegraphTab, frame: &mut Frame, area: Rect) {
                 0.0
             }
         };
+        let stat = |v: i64| format!("{} ({:.1}%)", format_count(v as u64), pct(v));
 
-        spans.push(" ▸ ".fg(ACCENT).bold());
-        spans.push(Span::styled(
-            truncate(&sel.name, 40),
-            Style::default().fg(BRIGHT).add_modifier(Modifier::BOLD),
-        ));
-        spans.push(sep.clone());
-        spans.push("self: ".fg(DIM));
-        spans.push(
-            format!(
-                "{} ({:.1}%)",
-                format_count(sel.self_value as u64),
-                pct(sel.self_value)
-            )
-            .fg(Color::Rgb(249, 115, 22)),
-        );
-        spans.push(sep.clone());
-        spans.push("total: ".fg(DIM));
-        spans.push(
-            format!(
-                "{} ({:.1}%)",
-                format_count(sel.total_value as u64),
-                pct(sel.total_value)
-            )
-            .fg(Color::Rgb(234, 179, 8)),
-        );
-        spans.push(sep);
-        spans.push("depth: ".fg(DIM));
-        spans.push(sel.depth.to_string().fg(Color::Rgb(130, 130, 150)));
+        spans.extend([
+            " ▸ ".fg(theme::ACCENT).bold(),
+            truncate(&sel.node.name, 40).fg(theme::BRIGHT).bold(),
+            sep(),
+            "self: ".fg(theme::DIM),
+            stat(sel.node.self_value).fg(theme::ORANGE),
+            sep(),
+            "total: ".fg(theme::DIM),
+            stat(sel.node.total_value).fg(theme::WARNING),
+            sep(),
+            "depth: ".fg(theme::DIM),
+            sel.depth.to_string().fg(theme::MUTED),
+        ]);
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -377,9 +259,10 @@ fn render_flamegraph(fg: &mut FlamegraphTab, frame: &mut Frame, area: Rect) {
         return;
     }
 
+    // Field path rather than `fg.zoom_root()` so `fg.scroll_y` stays assignable below.
     let zoom_root = fg.graph.root.follow_path(&fg.zoom_path);
     if zoom_root.total_value <= 0 {
-        render_empty_fg(buf, area);
+        render_empty(buf, area, "No profile data yet");
         return;
     }
 
@@ -390,50 +273,21 @@ fn render_flamegraph(fg: &mut FlamegraphTab, frame: &mut Frame, area: Rect) {
 
     let frames = layout_frames(zoom_root, area.width, forced_palette);
     let max_depth = frames.iter().map(|f| f.depth).max().unwrap_or(0);
-    let viewport_height = area.height as usize;
+    let viewport = area.height as usize;
     let root_total = zoom_root.total_value;
 
-    let cursor_depth = fg.cursor_path.len();
-    if viewport_height > 0 {
-        if cursor_depth < fg.scroll_y {
-            fg.scroll_y = cursor_depth;
-        }
-        if cursor_depth >= fg.scroll_y + viewport_height {
-            fg.scroll_y = cursor_depth - viewport_height + 1;
-        }
-    }
-    fg.scroll_y = fg
-        .scroll_y
-        .min(max_depth.saturating_sub(viewport_height.saturating_sub(1)));
+    // Keep the cursor's depth row on screen, then avoid trailing blank rows.
+    fg.scroll_y = fit_offset(fg.scroll_y, fg.cursor_path.len(), viewport)
+        .min(max_depth.saturating_sub(viewport.saturating_sub(1)));
+    let scroll_y = fg.scroll_y;
 
     let cursor_rect = cursor_frame_rect(zoom_root, &fg.cursor_path, area.width, forced_palette);
 
-    if let Some(ref cr) = cursor_rect {
-        fg.selection.name = cr.name.clone();
-        fg.selection.self_value = cr.self_value;
-        fg.selection.total_value = cr.total_value;
-        fg.selection.pct = if root_total > 0 {
-            cr.total_value as f64 / root_total as f64 * 100.0
-        } else {
-            0.0
-        };
-        fg.selection.depth = cr.depth;
-    }
-
-    for fr in &frames {
-        if fr.depth < fg.scroll_y {
-            continue;
-        }
-        let vis_depth = fr.depth - fg.scroll_y;
-        if vis_depth >= viewport_height {
-            continue;
-        }
-
-        let screen_y = area.y + vis_depth as u16;
-        if screen_y >= area.y + area.height {
-            continue;
-        }
-
+    for fr in frames
+        .iter()
+        .filter(|f| (scroll_y..scroll_y + viewport).contains(&f.depth))
+    {
+        let screen_y = area.y + (fr.depth - scroll_y) as u16;
         let is_cursor = cursor_rect
             .as_ref()
             .is_some_and(|cr| cr.depth == fr.depth && cr.x == fr.x);
@@ -443,113 +297,83 @@ fn render_flamegraph(fg: &mut FlamegraphTab, frame: &mut Frame, area: Rect) {
         } else {
             0.0
         };
-
-        let bg = if is_cursor {
-            lighten(flame_color(&fr.name, heat, fr.palette_index), 45)
-        } else {
-            flame_color(&fr.name, heat, fr.palette_index)
-        };
+        let mut bg = flame_color(&fr.name, heat, fr.palette_index);
+        if is_cursor {
+            bg = lighten(bg, 45);
+        }
         let fg_color = contrast_fg(bg);
 
         let x_start = area.x + fr.x;
-        let x_end = (area.x + fr.x + fr.width).min(area.x + area.width);
-        let border_color = darken(bg, 55);
-
-        for x in x_start..x_end {
+        let x_end = (x_start + fr.width).min(area.right());
+        fill(
+            buf,
+            Rect::new(x_start, screen_y, x_end.saturating_sub(x_start), 1),
+            Style::default().bg(bg),
+        );
+        for x in [x_start, x_end.saturating_sub(1)] {
             if let Some(cell) = buf.cell_mut((x, screen_y)) {
-                if x == x_start || x == x_end.saturating_sub(1) {
-                    cell.set_char('▏');
-                    cell.set_style(Style::default().fg(border_color).bg(bg));
-                } else {
-                    cell.set_char(' ');
-                    cell.set_style(Style::default().bg(bg));
-                }
+                cell.set_char('▏');
+                cell.set_style(Style::default().fg(darken(bg, 55)).bg(bg));
             }
         }
 
-        let inner_width = fr.width.saturating_sub(2);
+        let inner_width = fr.width.saturating_sub(2) as usize;
         if inner_width >= 3 {
-            let max_chars = inner_width as usize;
-            let name = truncate(&fr.name, max_chars);
-            let pad = (inner_width as usize).saturating_sub(name.len()) / 2;
-            let name_x = area.x + fr.x + 1 + pad as u16;
-
-            let style = if is_cursor {
-                Style::default()
-                    .fg(fg_color)
-                    .bg(bg)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(fg_color).bg(bg)
-            };
-            buf.set_string(name_x, screen_y, &name, style);
+            let name = truncate(&fr.name, inner_width);
+            let pad = inner_width.saturating_sub(name.chars().count()) / 2;
+            let mut style = Style::default().fg(fg_color).bg(bg);
+            if is_cursor {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            buf.set_string(x_start + 1 + pad as u16, screen_y, &name, style);
         }
 
         if fr.width >= 14 && root_total > 0 {
             let pct = fr.total_value as f64 / root_total as f64 * 100.0;
-            if pct >= 0.1 {
-                let pct_str = format!("{:.1}%", pct);
-                let pct_x = area.x + fr.x + fr.width - pct_str.len() as u16 - 2;
-                if pct_x > area.x + fr.x + 2 {
-                    let dim_fg = blend(fg_color, bg, 0.45);
-                    buf.set_string(
-                        pct_x,
-                        screen_y,
-                        &pct_str,
-                        Style::default().fg(dim_fg).bg(bg),
-                    );
-                }
+            let pct_str = format!("{pct:.1}%");
+            let pct_x = x_start + fr.width - pct_str.len() as u16 - 2;
+            if pct >= 0.1 && pct_x > x_start + 2 {
+                let dim_fg = blend(fg_color, bg, 0.45);
+                buf.set_string(
+                    pct_x,
+                    screen_y,
+                    &pct_str,
+                    Style::default().fg(dim_fg).bg(bg),
+                );
             }
         }
 
         if is_cursor
             && fr.width >= 3
-            && let Some(cell) = buf.cell_mut((area.x + fr.x + 1, screen_y))
+            && let Some(cell) = buf.cell_mut((x_start + 1, screen_y))
         {
             cell.set_char('▸');
-            cell.set_style(
-                Style::default()
-                    .fg(Color::White)
-                    .bg(bg)
-                    .add_modifier(Modifier::BOLD),
+            cell.set_style(bold(Color::White).bg(bg));
+        }
+    }
+
+    // Dotted filler for depth rows that have no frame wide enough to draw.
+    for vis_d in 0..viewport {
+        let depth = scroll_y + vis_d;
+        if depth <= max_depth && !frames.iter().any(|f| f.depth == depth) {
+            let y = area.y + vis_d as u16;
+            hline(
+                buf,
+                y,
+                area.left(),
+                area.right(),
+                '·',
+                Style::default().fg(theme::GHOST),
             );
         }
     }
-
-    for vis_d in 0..viewport_height {
-        let screen_y = area.y + vis_d as u16;
-        if screen_y >= area.y + area.height {
-            break;
-        }
-        let depth = fg.scroll_y + vis_d;
-        let has_frame = frames.iter().any(|f| f.depth == depth);
-        if !has_frame && depth <= max_depth {
-            for x in area.x..area.x + area.width {
-                if let Some(cell) = buf.cell_mut((x, screen_y)) {
-                    cell.set_char('·');
-                    cell.set_style(Style::default().fg(Color::Rgb(30, 30, 38)));
-                }
-            }
-        }
-    }
 }
 
-fn render_empty_fg(buf: &mut Buffer, area: Rect) {
-    let msg = "No profile data yet";
-    let y = area.y + area.height / 2;
-    let x = area.x + (area.width.saturating_sub(msg.len() as u16)) / 2;
-    buf.set_string(
-        x,
-        y,
-        msg,
-        Style::default()
-            .fg(Color::Rgb(90, 90, 110))
-            .add_modifier(Modifier::ITALIC),
-    );
-}
-
+// ---------------------------------------------------------------------------
 // Flamescope (subsecond-offset heatmap)
-const HEATMAP_STOPS: &[(f64, (u8, u8, u8))] = &[
+// ---------------------------------------------------------------------------
+
+const HEATMAP_STOPS: &Gradient = &[
     (0.00, (13, 8, 135)),
     (0.25, (126, 3, 168)),
     (0.50, (204, 71, 120)),
@@ -569,80 +393,49 @@ fn render_flamescope_detail_bar(fs: &FlamescopeTab, frame: &mut Frame, area: Rec
     }
 
     let (sec, ms_start, ms_end) = fs.selected_time();
-    let value = fs.selected_value();
-    let peak = fs.visible_peak();
-    let sep = " │ ".fg(Color::Rgb(55, 55, 65));
-
     let mut spans: Vec<Span> = Vec::new();
 
-    if let Some(ref filter) = fs.filter {
-        spans.push(format!(" filtered: {filter} ").fg(ACCENT).bold());
-        spans.push(sep.clone());
+    if let Some(filter) = &fs.filter {
+        spans.push(format!(" filtered: {filter} ").fg(theme::ACCENT).bold());
+        spans.push(sep());
     }
 
     spans.extend([
-        " ▸ ".fg(ACCENT).bold(),
-        Span::styled(
-            format!("{sec}s + {ms_start}\u{2013}{ms_end}ms"),
-            Style::default().fg(BRIGHT).add_modifier(Modifier::BOLD),
-        ),
-        sep.clone(),
-        "samples: ".fg(DIM),
-        format!("{value}").fg(Color::Rgb(249, 115, 22)),
-        sep.clone(),
-        "peak: ".fg(DIM),
-        format!("{peak}").fg(Color::Rgb(234, 179, 8)),
-        sep,
-        "duration: ".fg(DIM),
-        format!("{}s", fs.total_seconds()).fg(Color::Rgb(130, 130, 150)),
+        " ▸ ".fg(theme::ACCENT).bold(),
+        format!("{sec}s + {ms_start}\u{2013}{ms_end}ms")
+            .fg(theme::BRIGHT)
+            .bold(),
+        sep(),
+        "samples: ".fg(theme::DIM),
+        fs.selected_value().to_string().fg(theme::ORANGE),
+        sep(),
+        "peak: ".fg(theme::DIM),
+        fs.visible_peak().to_string().fg(theme::WARNING),
+        sep(),
+        "duration: ".fg(theme::DIM),
+        format!("{}s", fs.total_seconds()).fg(theme::MUTED),
     ]);
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_flamescope(fs: &mut FlamescopeTab, frame: &mut Frame, area: Rect) {
+fn render_flamescope(fs: &FlamescopeTab, frame: &mut Frame, area: Rect) {
     let Some(lay) = FlamescopeLayout::new(area) else {
         return;
     };
-
-    let total_cols = fs.visible_columns().len();
-    let peak = fs.visible_peak();
-
-    if total_cols > 0 {
-        fs.cursor_col = fs.cursor_col.min(total_cols - 1);
-    }
-    if fs.auto_scroll && total_cols > 0 {
-        fs.cursor_col = total_cols - 1;
-    }
-    if fs.cursor_col < fs.scroll_x {
-        fs.scroll_x = fs.cursor_col;
-    }
-    if fs.cursor_col >= fs.scroll_x + lay.visible_cols {
-        fs.scroll_x = fs.cursor_col + 1 - lay.visible_cols;
-    }
-
-    let vis_data = fs.visible_columns();
-    let cursor_col = fs.cursor_col;
-    let cursor_row = fs.cursor_row;
-    let scroll_x = fs.scroll_x;
     let buf = frame.buffer_mut();
 
-    if vis_data.is_empty() {
+    let data = fs.visible_columns();
+    if data.is_empty() {
         let msg = if fs.is_empty() {
             "No profile data yet"
         } else {
             "No data for this thread"
         };
-        let y = area.y + area.height / 2;
-        let x = area.x + (area.width.saturating_sub(msg.len() as u16)) / 2;
-        buf.set_string(
-            x,
-            y,
-            msg,
-            Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
-        );
+        render_empty(buf, area, msg);
         return;
     }
+    let peak = fs.visible_peak();
 
     for row in 0..lay.num_rows() {
         let y_start = lay.row_y(row);
@@ -652,77 +445,52 @@ fn render_flamescope(fs: &mut FlamescopeTab, frame: &mut Frame, area: Rect) {
 
         let label_y = y_start + lay.cell_h / 2;
         if label_y < lay.bottom() {
+            let label = format!("{:>3}ms ", lay.ms_label(row));
             buf.set_string(
                 lay.label_x(),
                 label_y,
-                format!("{:>3}ms ", lay.ms_label(row)),
-                Style::default().fg(DIM),
+                label,
+                Style::default().fg(theme::DIM),
             );
         }
 
         for col_off in 0..lay.visible_cols {
-            let col = scroll_x + col_off;
-            let value = vis_data.get(col).map_or(0, |c| c[row]);
-            let is_cursor = col == cursor_col && row == cursor_row;
+            let col = fs.col.offset + col_off;
+            let value = data.get(col).map_or(0, |c| c[row]);
+            let is_cursor = col == fs.col.index && row == fs.row;
 
-            if value == 0 && !is_cursor {
-                continue;
-            }
-
-            let bg = if value > 0 && peak > 0 {
-                let base = heatmap_color(value, peak);
-                if is_cursor { lighten(base, 50) } else { base }
-            } else if is_cursor {
-                Color::Rgb(40, 40, 55)
-            } else {
-                continue;
+            let bg = match (value > 0 && peak > 0, is_cursor) {
+                (true, true) => lighten(heatmap_color(value, peak), 50),
+                (true, false) => heatmap_color(value, peak),
+                (false, true) => theme::HIGHLIGHT_BG,
+                (false, false) => continue,
             };
 
-            let cell_x = lay.cell_x(col_off);
-            for dy in 0..lay.cell_h {
-                let y = y_start + dy;
-                if y >= lay.bottom() {
-                    break;
-                }
-                for dx in 0..lay.cell_w {
-                    let x = cell_x + dx;
-                    if x >= lay.right() {
-                        break;
-                    }
-                    if let Some(cell) = buf.cell_mut((x, y)) {
-                        cell.set_char(' ');
-                        cell.set_style(Style::default().bg(bg));
-                    }
-                }
-            }
+            let cell =
+                Rect::new(lay.cell_x(col_off), y_start, lay.cell_w, lay.cell_h).intersection(area);
+            fill(buf, cell, Style::default().bg(bg));
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Executables
+// ---------------------------------------------------------------------------
 
 fn render_exe_status_bar(status: Option<&str>, frame: &mut Frame, area: Rect) {
     let Some(status) = status else { return };
 
     let is_loading = status.starts_with("Loading") || status.starts_with("Removing");
-    let is_error = status.starts_with("Error");
-
-    let display = if is_loading {
-        format!("{status}...")
+    let (text, color) = if is_loading {
+        (format!("{status}..."), theme::WARNING)
+    } else if status.starts_with("Error") {
+        (status.to_owned(), theme::ERROR)
     } else {
-        status.to_owned()
-    };
-    let color = if is_loading {
-        Color::Rgb(234, 179, 8)
-    } else if is_error {
-        Color::Rgb(239, 68, 68)
-    } else {
-        Color::Rgb(34, 197, 94)
+        (status.to_owned(), theme::SUCCESS)
     };
 
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            " ".into(),
-            Span::styled(display, Style::default().fg(color)),
-        ])),
+        Paragraph::new(Line::from(vec![" ".into(), text.fg(color)])),
         area,
     );
 }
@@ -734,307 +502,108 @@ fn render_exe_table(exe: &mut ExecutablesTab, frame: &mut Frame, area: Rect) {
         return;
     }
 
-    let header_y = area.y;
     let col_id_w = 34u16.min(area.width / 3);
     let col_sym_w = 12u16;
     let col_name_w = area.width.saturating_sub(col_id_w + col_sym_w + 4);
-
-    let hdr_style = Style::default().fg(DIM).add_modifier(Modifier::BOLD);
-    buf.set_string(area.x + 1, header_y, "File ID", hdr_style);
-    buf.set_string(area.x + 1 + col_id_w, header_y, "Name", hdr_style);
-    buf.set_string(
+    let (id_x, name_x, sym_x) = (
+        area.x + 1,
+        area.x + 1 + col_id_w,
         area.x + 1 + col_id_w + col_name_w,
-        header_y,
-        "Symbols",
-        hdr_style,
     );
 
-    let sep_y = header_y + 1;
-    if sep_y >= area.y + area.height {
-        return;
-    }
-    for x in area.x..area.x + area.width {
-        if let Some(c) = buf.cell_mut((x, sep_y)) {
-            c.set_char('─');
-            c.set_style(Style::default().fg(SEP_COLOR));
-        }
-    }
+    let hdr = bold(theme::DIM);
+    buf.set_string(id_x, area.y, "File ID", hdr);
+    buf.set_string(name_x, area.y, "Name", hdr);
+    buf.set_string(sym_x, area.y, "Symbols", hdr);
 
-    let visible_rows = (area.y + area.height).saturating_sub(sep_y + 1) as usize;
+    let sep_y = area.y + 1;
+    hline(
+        buf,
+        sep_y,
+        area.left(),
+        area.right(),
+        '─',
+        Style::default().fg(theme::RULE),
+    );
+
+    let rows_y = sep_y + 1;
+    let visible_rows = area.bottom().saturating_sub(rows_y) as usize;
     if visible_rows == 0 {
         return;
     }
 
-    if exe.cursor < exe.scroll {
-        exe.scroll = exe.cursor;
-    }
-    if exe.cursor >= exe.scroll + visible_rows {
-        exe.scroll = exe.cursor + 1 - visible_rows;
+    if exe.list.is_empty() {
+        buf.set_string(
+            area.x + 2,
+            rows_y + 1,
+            "No executables discovered. Waiting for profiles...",
+            italic(theme::DIM),
+        );
+        return;
     }
 
-    let cursor_bg = Color::Rgb(40, 45, 65);
-    let na_fg = Color::Rgb(80, 80, 100);
-
-    for vis_row in 0..visible_rows {
-        let idx = exe.scroll + vis_row;
-        if idx >= exe.list.len() {
-            break;
-        }
+    exe.cursor.scroll_to_fit(visible_rows);
+    for (vis_row, idx) in exe.cursor.visible(visible_rows, exe.list.len()).enumerate() {
         let entry = &exe.list[idx];
-        let y = sep_y + 1 + vis_row as u16;
-        let is_cursor = idx == exe.cursor;
+        let y = rows_y + vis_row as u16;
+        let is_cursor = idx == exe.cursor.index;
         let is_sym = entry.num_ranges.is_some();
+        let row_bg = if is_cursor {
+            theme::HIGHLIGHT_BG
+        } else {
+            Color::Reset
+        };
+        let on_row = |fg: Color| Style::default().fg(fg).bg(row_bg);
 
         if is_cursor {
-            for x in area.x..area.x + area.width {
-                if let Some(c) = buf.cell_mut((x, y)) {
-                    c.set_char(' ');
-                    c.set_style(Style::default().bg(cursor_bg));
-                }
-            }
+            fill(
+                buf,
+                Rect::new(area.x, y, area.width, 1),
+                Style::default().bg(row_bg),
+            );
         }
 
-        let row_bg = if is_cursor { cursor_bg } else { Color::Reset };
-
-        let id_str = match entry.file_id {
-            Some(file_id) => {
-                let hex = file_id.format_hex();
-                if hex.len() > col_id_w as usize - 1 {
-                    format!("{}…", &hex[..col_id_w as usize - 2])
-                } else {
-                    hex
-                }
-            }
-            None => "N/A".to_string(),
-        };
-        let id_fg = if is_sym {
-            Color::Rgb(100, 100, 120)
-        } else {
-            na_fg
-        };
-        buf.set_string(
-            area.x + 1,
-            y,
-            &id_str,
-            Style::default().fg(id_fg).bg(row_bg),
+        let id_str = entry.file_id.map_or_else(
+            || "N/A".to_string(),
+            |id| truncate(&id.format_hex(), col_id_w as usize - 1),
         );
+        let id_fg = if is_sym {
+            theme::MUTED_DARK
+        } else {
+            theme::SUBTLE
+        };
+        buf.set_string(id_x, y, &id_str, on_row(id_fg));
 
         let prefix = if is_cursor { "▸ " } else { "  " };
-        let max_name = (col_name_w as usize).saturating_sub(prefix.len() + 1);
-        let name = truncate(&entry.name, max_name);
-        let name_fg = if is_cursor {
-            BRIGHT
-        } else if is_sym {
-            Color::Rgb(180, 180, 195)
-        } else {
-            Color::Rgb(120, 120, 140)
-        };
-        let name_style = if is_cursor {
-            Style::default()
-                .fg(name_fg)
-                .bg(row_bg)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(name_fg).bg(row_bg)
-        };
-        buf.set_string(
-            area.x + 1 + col_id_w,
-            y,
-            format!("{prefix}{name}"),
-            name_style,
+        let name = truncate(
+            &entry.name,
+            (col_name_w as usize).saturating_sub(prefix.len() + 1),
         );
+        let name_fg = match (is_cursor, is_sym) {
+            (true, _) => theme::BRIGHT,
+            (false, true) => theme::TEXT,
+            (false, false) => theme::MUTED,
+        };
+        let mut name_style = on_row(name_fg);
+        if is_cursor {
+            name_style = name_style.add_modifier(Modifier::BOLD);
+        }
+        buf.set_string(name_x, y, format!("{prefix}{name}"), name_style);
 
         let sym_str = entry
             .num_ranges
             .map_or("N/A".to_string(), |n| format_count(n as u64));
         let sym_fg = if is_sym {
-            Color::Rgb(34, 197, 94)
+            theme::SUCCESS
         } else {
-            na_fg
+            theme::SUBTLE
         };
-        buf.set_string(
-            area.x + 1 + col_id_w + col_name_w,
-            y,
-            &sym_str,
-            Style::default().fg(sym_fg).bg(row_bg),
-        );
-    }
-
-    if exe.list.is_empty() && !exe.path_input.active {
-        let msg = "No executables discovered. Waiting for profiles...";
-        let y = sep_y + 2;
-        if y < area.y + area.height {
-            buf.set_string(
-                area.x + 2,
-                y,
-                msg,
-                Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
-            );
-        }
-    }
-}
-
-struct OverlayProps<'a> {
-    title: &'a str,
-    input: &'a str,
-    items: &'a [&'a str],
-    cursor: usize,
-    border_color: Color,
-    max_visible: usize,
-    empty_hint: &'a str,
-    popup_width: u16,
-}
-
-fn render_overlay(frame: &mut Frame, area: Rect, props: &OverlayProps) {
-    let buf = frame.buffer_mut();
-
-    let popup_w = props.popup_width.min(area.width.saturating_sub(4));
-    if popup_w < 10 {
-        return;
-    }
-
-    let match_count = props.items.len().min(props.max_visible);
-    let popup_h = (match_count as u16 + 4).min(area.height.saturating_sub(2));
-    if popup_h < 4 {
-        return;
-    }
-
-    let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
-    let popup_y = area.y + area.height.saturating_sub(popup_h);
-    let popup = Rect::new(popup_x, popup_y, popup_w, popup_h);
-
-    clear_rect(buf, popup);
-    draw_popup_border(buf, popup, props.title, props.border_color);
-
-    let inner_w = popup.width.saturating_sub(2) as usize;
-    let prompt = format!(" / {}█", truncate(props.input, inner_w.saturating_sub(5)));
-    buf.set_string(
-        popup.x + 1,
-        popup.y + 1,
-        truncate(&prompt, inner_w),
-        Style::reset().fg(BRIGHT),
-    );
-
-    for x in (popup.x + 1)..(popup.x + popup.width - 1) {
-        if let Some(c) = buf.cell_mut((x, popup.y + 2)) {
-            c.set_char('─');
-            c.set_style(Style::reset().fg(Color::Rgb(60, 60, 75)));
-        }
-    }
-
-    let list_y = popup.y + 3;
-    let visible = match_count.min((popup.height.saturating_sub(4)) as usize);
-
-    if props.items.is_empty() {
-        buf.set_string(
-            popup.x + 2,
-            list_y,
-            props.empty_hint,
-            Style::reset()
-                .fg(Color::Rgb(80, 80, 100))
-                .add_modifier(Modifier::ITALIC),
-        );
-        return;
-    }
-
-    let scroll_off = props.cursor.saturating_sub(visible.saturating_sub(1));
-    let match_fg = Color::Rgb(180, 180, 195);
-    let dir_fg = Color::Rgb(96, 165, 250);
-    let highlight_bg = Color::Rgb(40, 45, 65);
-
-    for i in 0..visible {
-        let idx = scroll_off + i;
-        if idx >= props.items.len() {
-            break;
-        }
-        let item = props.items[idx];
-        let y = list_y + i as u16;
-        let selected = idx == props.cursor;
-        let is_dir = item.ends_with('/');
-
-        let row_fg = if selected {
-            BRIGHT
-        } else if is_dir {
-            dir_fg
-        } else {
-            match_fg
-        };
-
-        if selected {
-            for x in (popup.x + 1)..(popup.x + popup.width - 1) {
-                if let Some(c) = buf.cell_mut((x, y)) {
-                    c.set_char(' ');
-                    c.set_style(Style::reset().bg(highlight_bg));
-                }
-            }
-        }
-
-        let prefix = if selected { " ▸ " } else { "   " };
-        let display = format!("{prefix}{}", truncate(item, inner_w.saturating_sub(3)));
-        let style = if selected {
-            Style::reset()
-                .fg(row_fg)
-                .bg(highlight_bg)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::reset().fg(row_fg)
-        };
-        buf.set_string(popup.x + 1, y, &display, style);
-    }
-}
-
-fn clear_rect(buf: &mut Buffer, r: Rect) {
-    for y in r.y..r.y + r.height {
-        for x in r.x..r.x + r.width {
-            if let Some(c) = buf.cell_mut((x, y)) {
-                c.set_char(' ');
-                c.set_style(Style::reset());
-            }
-        }
-    }
-}
-
-fn draw_popup_border(buf: &mut Buffer, popup: Rect, title: &str, border_color: Color) {
-    let bot_y = popup.y + popup.height - 1;
-    let border = Style::reset().fg(border_color);
-
-    for &(y, left, right) in &[(popup.y, '╭', '╮'), (bot_y, '╰', '╯')] {
-        for x in popup.x..popup.x + popup.width {
-            if let Some(c) = buf.cell_mut((x, y)) {
-                let ch = if x == popup.x {
-                    left
-                } else if x == popup.x + popup.width - 1 {
-                    right
-                } else {
-                    '─'
-                };
-                c.set_char(ch);
-                c.set_style(border);
-            }
-        }
-    }
-
-    if title.len() + 3 <= popup.width as usize {
-        buf.set_string(
-            popup.x + 2,
-            popup.y,
-            title,
-            Style::reset().fg(BRIGHT).add_modifier(Modifier::BOLD),
-        );
-    }
-
-    for y in (popup.y + 1)..bot_y {
-        for &x in &[popup.x, popup.x + popup.width - 1] {
-            if let Some(c) = buf.cell_mut((x, y)) {
-                c.set_char('│');
-                c.set_style(border);
-            }
-        }
+        buf.set_string(sym_x, y, &sym_str, on_row(sym_fg));
     }
 }
 
 // ---------------------------------------------------------------------------
-// Footer key-hints (shared between tabs via data slices)
+// Footer key hints
 // ---------------------------------------------------------------------------
 
 const FLAMEGRAPH_KEYS: &[(&str, &str)] = &[
@@ -1047,12 +616,6 @@ const FLAMEGRAPH_KEYS: &[(&str, &str)] = &[
     ("[Esc]", " back "),
     ("[/]", " search "),
     ("[r]", " reset "),
-];
-
-const SEARCH_KEYS: &[(&str, &str)] = &[
-    ("[Esc]", " cancel "),
-    ("[Enter]", " select "),
-    ("[↑↓]", " navigate "),
 ];
 
 const FLAMESCOPE_KEYS: &[(&str, &str)] = &[
@@ -1075,40 +638,19 @@ const EXE_KEYS: &[(&str, &str)] = &[
     ("[q]", " quit "),
 ];
 
-const EXE_INPUT_KEYS: &[(&str, &str)] = &[
-    ("[Esc]", " cancel "),
-    ("[Tab]", " complete "),
-    ("[↑↓]", " navigate "),
-    ("[Enter]", " load "),
-];
-
-fn render_keyhints(
-    overlay_active: bool,
-    normal: &[(&str, &str)],
-    overlay: &[(&str, &str)],
-    frame: &mut Frame,
-    area: Rect,
-) {
-    let key_fg = Color::Rgb(80, 80, 100);
-    let desc_fg = Color::Rgb(55, 55, 65);
-    let hints = if overlay_active { overlay } else { normal };
-
-    let spans: Vec<Span> = hints
-        .iter()
-        .enumerate()
-        .flat_map(|(i, (k, d))| {
-            let prefix = if i == 0 { " " } else { "" };
-            [format!("{prefix}{k}").fg(key_fg), (*d).fg(desc_fg)]
-        })
-        .collect();
-
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)).alignment(Alignment::Left),
-        area,
-    );
+fn tab_keys(tab: ActiveTab) -> &'static [(&'static str, &'static str)] {
+    match tab {
+        ActiveTab::Flamegraph => FLAMEGRAPH_KEYS,
+        ActiveTab::Flamescope => FLAMESCOPE_KEYS,
+        ActiveTab::Executables => EXE_KEYS,
+    }
 }
 
-const PALETTES: &[&[(f64, (u8, u8, u8))]] = &[
+// ---------------------------------------------------------------------------
+// Flame colors
+// ---------------------------------------------------------------------------
+
+const PALETTES: &[&Gradient] = &[
     &[
         (0.00, (253, 224, 71)),
         (0.25, (251, 191, 36)),
@@ -1175,13 +717,15 @@ const PALETTES: &[&[(f64, (u8, u8, u8))]] = &[
     ],
 ];
 
+/// Palette color for `heat` (self/total ratio), jittered per frame name so
+/// adjacent frames with equal heat stay distinguishable.
 fn flame_color(name: &str, heat: f64, palette_index: usize) -> Color {
     let hash = name.bytes().fold(0u64, |h, b| {
         h.wrapping_mul(2654435761).wrapping_add(b as u64)
     });
 
     let stops = PALETTES[palette_index % PALETTES.len()];
-    let (r, g, b) = gradient(heat.clamp(0.0, 1.0), stops);
+    let (r, g, b) = gradient(heat, stops);
 
     let rv = ((hash % 18) as i16 - 9).clamp(-12, 12);
     let gv = (((hash >> 5) % 14) as i16 - 7).clamp(-10, 10);
@@ -1193,107 +737,92 @@ fn flame_color(name: &str, heat: f64, palette_index: usize) -> Color {
     )
 }
 
-fn gradient(t: f64, stops: &[(f64, (u8, u8, u8))]) -> (u8, u8, u8) {
-    let t = t.clamp(0.0, 1.0);
-    for i in 0..stops.len() - 1 {
-        let (t0, c0) = stops[i];
-        let (t1, c1) = stops[i + 1];
-        if t <= t1 {
-            let s = if (t1 - t0).abs() < f64::EPSILON {
-                0.0
-            } else {
-                (t - t0) / (t1 - t0)
-            };
-            return (
-                lerp_u8(c0.0, c1.0, s),
-                lerp_u8(c0.1, c1.1, s),
-                lerp_u8(c0.2, c1.2, s),
-            );
-        }
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use ratatui::{
+        Terminal,
+        backend::TestBackend,
+        crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
+    };
+
+    use super::*;
+    use crate::flamegraph::FlameGraph;
+    use crate::tui::event::Event;
+
+    fn key(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
     }
-    stops.last().unwrap().1
-}
 
-fn lerp_u8(a: u8, b: u8, t: f64) -> u8 {
-    ((1.0 - t) * a as f64 + t * b as f64).round() as u8
-}
-
-fn contrast_fg(bg: Color) -> Color {
-    match bg {
-        Color::Rgb(r, g, b) => {
-            let lum = 0.299 * r as f64 + 0.587 * g as f64 + 0.114 * b as f64;
-            if lum > 160.0 {
-                Color::Rgb(20, 18, 15)
-            } else {
-                Color::Rgb(250, 248, 245)
-            }
-        }
-        _ => Color::White,
+    fn populated_state() -> State {
+        let mut state = State::new("0.0.0.0:4317".into(), vec![]);
+        let mut fg = FlameGraph::new();
+        fg.add_stack(&["worker-1".into(), "main".into(), "do_work".into()], 30);
+        fg.add_stack(&["worker-2".into(), "main".into()], 10);
+        let timestamps = HashMap::from([("worker-1".to_string(), vec![0u64, 1_500_000_000])]);
+        state.handle_event(Event::ProfileUpdate {
+            flamegraph: fg,
+            samples: 40,
+            timestamps,
+        });
+        state.handle_event(Event::MappingsDiscovered(vec![
+            "libc.so.6".into(),
+            "app".into(),
+        ]));
+        state
     }
-}
 
-fn lighten(c: Color, amount: u8) -> Color {
-    match c {
-        Color::Rgb(r, g, b) => Color::Rgb(
-            r.saturating_add(amount),
-            g.saturating_add(amount),
-            b.saturating_add(amount),
-        ),
-        _ => c,
-    }
-}
-
-fn darken(c: Color, amount: u8) -> Color {
-    match c {
-        Color::Rgb(r, g, b) => Color::Rgb(
-            r.saturating_sub(amount),
-            g.saturating_sub(amount),
-            b.saturating_sub(amount),
-        ),
-        _ => c,
-    }
-}
-
-fn blend(c1: Color, c2: Color, t: f64) -> Color {
-    match (c1, c2) {
-        (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) => {
-            Color::Rgb(lerp_u8(r1, r2, t), lerp_u8(g1, g2, t), lerp_u8(b1, b2, t))
-        }
-        _ => c1,
-    }
-}
-
-fn fill(buf: &mut Buffer, r: Rect, color: Color) {
-    let style = Style::reset().bg(color);
-    for y in r.y..r.y + r.height {
-        for x in r.x..r.x + r.width {
-            if let Some(c) = buf.cell_mut((x, y)) {
-                c.set_char(' ');
-                c.set_style(style);
-            }
-        }
-    }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else if max <= 1 {
-        s.chars().take(max).collect()
-    } else {
-        s.chars()
-            .take(max - 1)
-            .chain(std::iter::once('…'))
+    fn draw(state: &mut State, width: u16, height: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        term.draw(|f| render(state, f)).unwrap();
+        term.backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
             .collect()
     }
-}
 
-fn format_count(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}K", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
+    #[test]
+    fn waiting_screen_before_data() {
+        let mut state = State::new("0.0.0.0:4317".into(), vec![]);
+        assert!(draw(&mut state, 100, 20).contains("Listening on 0.0.0.0:4317"));
+    }
+
+    #[test]
+    fn every_tab_renders_with_and_without_picker_at_awkward_sizes() {
+        let mut state = populated_state();
+        for (w, h) in [(120, 40), (40, 8), (12, 3)] {
+            for _ in 0..3 {
+                draw(&mut state, w, h);
+                state.handle_event(key(KeyCode::Char('/')));
+                assert!(state.active_picker().is_some());
+                draw(&mut state, w, h);
+                state.handle_event(key(KeyCode::Esc));
+                assert!(state.active_picker().is_none());
+                state.handle_event(key(KeyCode::Tab));
+            }
+        }
+    }
+
+    #[test]
+    fn detail_bar_follows_cursor() {
+        let mut state = populated_state();
+        state.handle_event(key(KeyCode::Down));
+        state.handle_event(key(KeyCode::Down));
+        let screen = draw(&mut state, 100, 20);
+        assert!(screen.contains("depth: 2"), "{screen}");
+        assert!(screen.contains("▸ main"), "{screen}");
+    }
+
+    #[test]
+    fn executables_table_lists_discovered_mappings() {
+        let mut state = populated_state();
+        state.handle_event(key(KeyCode::Tab));
+        state.handle_event(key(KeyCode::Tab));
+        let screen = draw(&mut state, 100, 20);
+        assert!(screen.contains("libc.so.6"), "{screen}");
+        assert!(screen.contains("▸ libc.so.6"), "{screen}");
     }
 }

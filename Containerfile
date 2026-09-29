@@ -1,4 +1,4 @@
-FROM rust:1.90-slim-bullseye AS builder
+FROM rust:1.90-slim-bookworm AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends cmake g++ make protobuf-compiler && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
@@ -13,7 +13,7 @@ RUN cargo build --locked --release
 RUN mkdir -p build-out/
 RUN cp target/release/eprofiler-tui build-out/
 
-FROM debian:bullseye-slim AS runner
+FROM debian:bookworm-slim AS runner
 WORKDIR /app
 COPY --from=builder /src/build-out/eprofiler-tui .
 USER 1000:1000

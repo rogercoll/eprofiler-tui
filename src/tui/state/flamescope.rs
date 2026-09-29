@@ -2,23 +2,31 @@ use std::collections::HashMap;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
-use super::{SearchAction, SearchOverlay};
+use super::flamegraph::THREAD_PICKER;
+use crate::tui::widgets::{Cursor, Picker, PickerEvent};
 
 const SUBSECOND_ROWS: usize = 10;
 const NS_PER_SEC: u64 = 1_000_000_000;
 const NS_PER_ROW: u64 = NS_PER_SEC / SUBSECOND_ROWS as u64;
 
+/// Number of one-second columns visible at once.
+pub const VISIBLE_COLS: usize = 30;
+
+pub type Column = [u64; SUBSECOND_ROWS];
+
 pub struct FlamescopeTab {
     epoch_ns: Option<u64>,
-    columns: Vec<[u64; SUBSECOND_ROWS]>,
-    threads: HashMap<String, Vec<[u64; SUBSECOND_ROWS]>>,
+    columns: Vec<Column>,
+    threads: HashMap<String, Vec<Column>>,
     thread_names: Vec<String>,
     pub filter: Option<String>,
-    pub search: SearchOverlay,
+    pub picker: Option<Picker>,
+    /// Follow the newest column as data arrives.
     pub auto_scroll: bool,
-    pub scroll_x: usize,
-    pub cursor_col: usize,
-    pub cursor_row: usize,
+    /// Selected second (`index`) and first visible second (`offset`).
+    pub col: Cursor,
+    /// Selected subsecond row.
+    pub row: usize,
 }
 
 impl Default for FlamescopeTab {
@@ -29,11 +37,10 @@ impl Default for FlamescopeTab {
             threads: HashMap::new(),
             thread_names: Vec::new(),
             filter: None,
-            search: SearchOverlay::default(),
+            picker: None,
             auto_scroll: true,
-            scroll_x: 0,
-            cursor_col: 0,
-            cursor_row: 0,
+            col: Cursor::default(),
+            row: 0,
         }
     }
 }
@@ -50,6 +57,7 @@ impl FlamescopeTab {
                     .unwrap_or_else(|e| e);
                 self.thread_names.insert(pos, thread.clone());
             }
+            let thread_cols = self.threads.entry(thread.clone()).or_default();
 
             for &ts in timestamps {
                 let epoch = *self.epoch_ns.get_or_insert(ts);
@@ -58,47 +66,41 @@ impl FlamescopeTab {
                 let row =
                     ((offset % NS_PER_SEC) / NS_PER_ROW).min(SUBSECOND_ROWS as u64 - 1) as usize;
 
-                while self.columns.len() <= col {
-                    self.columns.push([0; SUBSECOND_ROWS]);
-                }
-                self.columns[col][row] += 1;
-
-                let thread_cols = self.threads.entry(thread.clone()).or_default();
-                while thread_cols.len() <= col {
-                    thread_cols.push([0; SUBSECOND_ROWS]);
-                }
-                thread_cols[col][row] += 1;
+                bump(&mut self.columns, col, row);
+                bump(thread_cols, col, row);
             }
         }
+        self.sync_cursor();
     }
 
     pub fn is_empty(&self) -> bool {
         self.columns.is_empty()
     }
 
-    pub fn visible_columns(&self) -> &[[u64; SUBSECOND_ROWS]] {
+    pub fn visible_columns(&self) -> &[Column] {
         match &self.filter {
-            Some(name) => self.threads.get(name).map_or(&[], |v| v.as_slice()),
+            Some(name) => self.threads.get(name).map_or(&[], Vec::as_slice),
             None => &self.columns,
         }
     }
 
     pub fn selected_value(&self) -> u64 {
         self.visible_columns()
-            .get(self.cursor_col)
-            .map_or(0, |col| col[self.cursor_row])
+            .get(self.col.index)
+            .map_or(0, |col| col[self.row])
     }
 
+    /// `(second, ms_start, ms_end)` of the selected cell.
     pub fn selected_time(&self) -> (usize, usize, usize) {
-        let ms_start = (self.cursor_row * 1000) / SUBSECOND_ROWS;
-        let ms_end = ((self.cursor_row + 1) * 1000) / SUBSECOND_ROWS;
-        (self.cursor_col, ms_start, ms_end)
+        let ms_start = (self.row * 1000) / SUBSECOND_ROWS;
+        let ms_end = ((self.row + 1) * 1000) / SUBSECOND_ROWS;
+        (self.col.index, ms_start, ms_end)
     }
 
     pub fn visible_peak(&self) -> u64 {
         self.visible_columns()
             .iter()
-            .flat_map(|col| col.iter())
+            .flatten()
             .copied()
             .max()
             .unwrap_or(0)
@@ -108,66 +110,118 @@ impl FlamescopeTab {
         self.visible_columns().len()
     }
 
+    /// Clamp the column cursor to the data, snap to the newest column when
+    /// auto-scrolling, and keep it inside the fixed-width viewport.
+    fn sync_cursor(&mut self) {
+        let len = self.visible_columns().len();
+        self.col.clamp(len);
+        if self.auto_scroll {
+            self.col.last(len);
+        }
+        self.col.scroll_to_fit(VISIBLE_COLS);
+    }
+
     pub(crate) fn handle_key(&mut self, key: KeyEvent) {
-        if self.search.active {
-            return self.handle_search_key(key);
+        if self.picker.is_some() {
+            return self.handle_picker_key(key);
         }
         match key.code {
             KeyCode::Right | KeyCode::Char('l') => {
                 self.auto_scroll = false;
-                let total = self.visible_columns().len();
-                if total > 0 && self.cursor_col + 1 < total {
-                    self.cursor_col += 1;
-                }
+                self.col.next(self.visible_columns().len());
             }
             KeyCode::Left | KeyCode::Char('h') => {
                 self.auto_scroll = false;
-                self.cursor_col = self.cursor_col.saturating_sub(1);
+                self.col.prev();
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.cursor_row + 1 < SUBSECOND_ROWS {
-                    self.cursor_row += 1;
+                if self.row + 1 < SUBSECOND_ROWS {
+                    self.row += 1;
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.cursor_row = self.cursor_row.saturating_sub(1);
-            }
+            KeyCode::Up | KeyCode::Char('k') => self.row = self.row.saturating_sub(1),
             KeyCode::Char('/') => {
-                self.search.open();
-                self.refresh_search();
+                let mut picker = Picker::new(&THREAD_PICKER);
+                picker.refresh(self.thread_names.iter().map(String::as_str));
+                self.picker = Some(picker);
             }
             KeyCode::Esc => {
                 self.filter = None;
                 self.auto_scroll = true;
             }
-            KeyCode::Char('G') | KeyCode::End => {
-                self.auto_scroll = true;
-            }
+            KeyCode::Char('G') | KeyCode::End => self.auto_scroll = true,
             KeyCode::Char('r') => *self = Self::default(),
             _ => {}
         }
+        self.sync_cursor();
     }
 
-    fn handle_search_key(&mut self, key: KeyEvent) {
-        match self.search.handle_key(key) {
-            SearchAction::Selected(Some(name)) => {
-                self.filter = Some(name);
-                self.cursor_col = 0;
-                self.scroll_x = 0;
-                self.auto_scroll = true;
+    fn handle_picker_key(&mut self, key: KeyEvent) {
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        match picker.handle_key(key) {
+            Some(PickerEvent::Changed) => {
+                picker.refresh(self.thread_names.iter().map(String::as_str))
             }
-            SearchAction::Refresh => self.refresh_search(),
-            _ => {}
+            Some(PickerEvent::Cancel) => self.picker = None,
+            Some(PickerEvent::Submit) => {
+                let picked = self
+                    .picker
+                    .take()
+                    .and_then(|p| p.selected().map(str::to_owned));
+                if let Some(name) = picked {
+                    self.filter = Some(name);
+                    self.col.reset();
+                    self.auto_scroll = true;
+                    self.sync_cursor();
+                }
+            }
+            None => {}
         }
     }
+}
 
-    fn refresh_search(&mut self) {
-        let query = self.search.input.to_lowercase();
-        self.search.matches = self
-            .thread_names
-            .iter()
-            .filter(|name| query.is_empty() || name.to_lowercase().contains(&query))
-            .cloned()
-            .collect();
+/// Increment `cols[col][row]`, growing `cols` with empty columns as needed.
+fn bump(cols: &mut Vec<Column>, col: usize, row: usize) {
+    if cols.len() <= col {
+        cols.resize(col + 1, [0; SUBSECOND_ROWS]);
+    }
+    cols[col][row] += 1;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tab_with(ts: &[u64]) -> FlamescopeTab {
+        let mut tab = FlamescopeTab::default();
+        tab.record_timestamps(&HashMap::from([("t".to_string(), ts.to_vec())]));
+        tab
+    }
+
+    #[test]
+    fn timestamps_bucket_into_seconds_and_rows() {
+        let tab = tab_with(&[0, 150_000_000, NS_PER_SEC * 2 + 950_000_000]);
+        let cols = tab.visible_columns();
+        assert_eq!(cols.len(), 3);
+        assert_eq!(cols[0][0], 1);
+        assert_eq!(cols[0][1], 1);
+        assert_eq!(cols[2][9], 1);
+    }
+
+    #[test]
+    fn auto_scroll_follows_newest_column() {
+        let tab = tab_with(&[0, NS_PER_SEC * 40]);
+        assert_eq!(tab.col.index, 40);
+        assert_eq!(tab.col.offset, 40 + 1 - VISIBLE_COLS);
+    }
+
+    #[test]
+    fn filter_without_data_yields_empty_view() {
+        let mut tab = tab_with(&[0]);
+        tab.filter = Some("other".into());
+        assert!(tab.visible_columns().is_empty());
+        assert_eq!(tab.selected_value(), 0);
     }
 }

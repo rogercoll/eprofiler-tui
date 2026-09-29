@@ -1,14 +1,27 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
-use super::{SearchAction, SearchOverlay};
 use crate::flamegraph::{FlameGraph, FlameNode};
+use crate::tui::theme;
+use crate::tui::widgets::{Picker, PickerEvent, PickerStyle};
 
-#[derive(Default)]
-pub struct Selection {
-    pub name: String,
-    pub self_value: i64,
-    pub total_value: i64,
-    pub pct: f64,
+pub const SEARCH_KEYS: &[(&str, &str)] = &[
+    ("[Esc]", " cancel "),
+    ("[Enter]", " select "),
+    ("[↑↓]", " navigate "),
+];
+
+pub static THREAD_PICKER: PickerStyle = PickerStyle {
+    title: " thread.name ",
+    placeholder: "type to filter threads...",
+    border: theme::POPUP_BORDER,
+    width: 50,
+    max_visible: 3,
+    keys: SEARCH_KEYS,
+};
+
+/// The frame under the cursor, derived from the graph on demand.
+pub struct Selected<'a> {
+    pub node: &'a FlameNode,
     pub depth: usize,
 }
 
@@ -17,11 +30,13 @@ pub struct FlamegraphTab {
     pub frozen: bool,
     pub profiles_received: u64,
     pub samples_received: u64,
+    /// First visible depth row.
     pub scroll_y: usize,
+    /// Child indices from the zoom root down to the cursor.
     pub cursor_path: Vec<usize>,
+    /// Frame names from the real root down to the zoom root.
     pub zoom_path: Vec<String>,
-    pub selection: Selection,
-    pub search: SearchOverlay,
+    pub picker: Option<Picker>,
 }
 
 impl Default for FlamegraphTab {
@@ -34,8 +49,7 @@ impl Default for FlamegraphTab {
             scroll_y: 0,
             cursor_path: Vec::new(),
             zoom_path: Vec::new(),
-            selection: Selection::default(),
-            search: SearchOverlay::default(),
+            picker: None,
         }
     }
 }
@@ -51,11 +65,21 @@ impl FlamegraphTab {
         self.samples_received += samples;
     }
 
-    fn zoom_root(&self) -> &FlameNode { self.graph.root.follow_path(&self.zoom_path) }
+    pub fn zoom_root(&self) -> &FlameNode {
+        self.graph.root.follow_path(&self.zoom_path)
+    }
+
+    pub fn selected(&self) -> Option<Selected<'_>> {
+        let node = self.zoom_root().descend(&self.cursor_path)?;
+        Some(Selected {
+            node,
+            depth: self.cursor_path.len(),
+        })
+    }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) {
-        if self.search.active {
-            return self.handle_search_key(key);
+        if self.picker.is_some() {
+            return self.handle_picker_key(key);
         }
         match key.code {
             KeyCode::Char('f') | KeyCode::Char(' ') => self.frozen = !self.frozen,
@@ -66,45 +90,51 @@ impl FlamegraphTab {
             KeyCode::Enter => self.zoom_in(),
             KeyCode::Esc | KeyCode::Backspace => self.zoom_out(),
             KeyCode::Char('r') => self.reset(),
-            KeyCode::Char('/') => {
-                self.search.open();
-                self.refresh_search();
-            }
+            KeyCode::Char('/') => self.open_search(),
             _ => {}
         };
     }
 
-    fn handle_search_key(&mut self, key: KeyEvent) {
-        match self.search.handle_key(key) {
-            SearchAction::Selected(Some(name)) => {
-                self.zoom_path = vec![name];
-                self.cursor_path.clear();
-                self.scroll_y = 0;
+    fn open_search(&mut self) {
+        let mut picker = Picker::new(&THREAD_PICKER);
+        picker.refresh(self.thread_names());
+        self.picker = Some(picker);
+    }
+
+    fn thread_names(&self) -> impl Iterator<Item = &str> {
+        self.graph.root.children.iter().map(|c| c.name.as_str())
+    }
+
+    fn handle_picker_key(&mut self, key: KeyEvent) {
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        match picker.handle_key(key) {
+            Some(PickerEvent::Changed) => {
+                let names = self.graph.root.children.iter().map(|c| c.name.as_str());
+                picker.refresh(names);
             }
-            SearchAction::Refresh => self.refresh_search(),
-            _ => {}
+            Some(PickerEvent::Cancel) => self.picker = None,
+            Some(PickerEvent::Submit) => {
+                let picked = self
+                    .picker
+                    .take()
+                    .and_then(|p| p.selected().map(str::to_owned));
+                if let Some(name) = picked {
+                    self.zoom_path = vec![name];
+                    self.reset_cursor();
+                }
+            }
+            None => {}
         }
     }
 
-    fn refresh_search(&mut self) {
-        let query = self.search.input.to_lowercase();
-        self.search.matches = self
-            .graph
-            .root
-            .children
-            .iter()
-            .filter(|c| query.is_empty() || c.name.to_lowercase().contains(&query))
-            .map(|c| c.name.clone())
-            .collect();
+    fn cursor_node(&self) -> &FlameNode {
+        self.zoom_root().follow_indices(&self.cursor_path)
     }
 
     fn move_down(&mut self) {
-        if !self
-            .zoom_root()
-            .follow_indices(&self.cursor_path)
-            .children
-            .is_empty()
-        {
+        if !self.cursor_node().children.is_empty() {
             self.cursor_path.push(0);
         }
     }
@@ -120,16 +150,16 @@ impl FlamegraphTab {
     }
 
     fn move_right(&mut self) {
-        if self.cursor_path.is_empty() {
+        let Some(depth) = self.cursor_path.len().checked_sub(1) else {
             return;
-        }
-        let sibling_count = self
+        };
+        let siblings = self
             .zoom_root()
-            .follow_indices(&self.cursor_path[..self.cursor_path.len() - 1])
+            .follow_indices(&self.cursor_path[..depth])
             .children
             .len();
         if let Some(last) = self.cursor_path.last_mut()
-            && *last + 1 < sibling_count
+            && *last + 1 < siblings
         {
             *last += 1;
         }
@@ -141,24 +171,25 @@ impl FlamegraphTab {
         }
         let names = collect_path_names(self.zoom_root(), &self.cursor_path);
         self.zoom_path.extend(names);
-        self.cursor_path.clear();
-        self.scroll_y = 0;
+        self.reset_cursor();
     }
 
     fn zoom_out(&mut self) {
         if self.zoom_path.pop().is_some() {
-            self.cursor_path.clear();
-            self.scroll_y = 0;
+            self.reset_cursor();
         }
     }
 
-    fn reset(&mut self) {
-        self.graph = FlameGraph::new();
-        self.profiles_received = 0;
-        self.samples_received = 0;
-        self.zoom_path.clear();
+    fn reset_cursor(&mut self) {
         self.cursor_path.clear();
         self.scroll_y = 0;
+    }
+
+    fn reset(&mut self) {
+        *self = Self {
+            frozen: self.frozen,
+            ..Self::default()
+        };
     }
 }
 
