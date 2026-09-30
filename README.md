@@ -14,20 +14,21 @@ A terminal-based flamegraph viewer that receives profiling data via an OTLP gRPC
 ## Features
 
 - OTLP gRPC profiles receiver (default `0.0.0.0:4317`, configurable via `--port`)
-- Live icicle-style flamegraph with hot/warm color scheme
+- Live icicle-style flamegraph
+- Stable frame colors: the hue comes from the runtime (Go, JVM, Python, Kernel, etc.), application code is vivid while runtime and system code is pastel, and frames with more self time are brighter
 - Freeze/live toggle to pause updates for smooth navigation
-- Frame type annotations (`[Native]`, `[Kernel]`, `[JVM]`, etc.)
-- Thread/process grouping via `thread.name` sample attribute
+- Detail bar showing the selected frame's runtime and origin (e.g. `Go · runtime`)
+- Stacks grouped by thread, using the `thread.name` sample attribute
 - Keyboard-driven navigation and zoom
-- Thread search (`/`) with fuzzy filtering
+- Thread search (`/`) with substring filtering
 - **Experimental**: Flamescope tab (https://www.brendangregg.com/flamescope.html)
-- **Experimental**: Executables tab — load debug symbols from ELF/DWARF binaries for inline-aware symbolization (persistent LSM-tree store survives restarts)
+- **Experimental**: Executables tab to load debug symbols from ELF/DWARF binaries for inline-aware symbolization. Symbols are kept in a persistent LSM-tree store, so they survive restarts
 
 ![Demo](content/assets/quickstart.gif)
 
 ## Installation
 
-No Rust toolchain required — you can run `eprofiler-tui` directly with Docker or Podman:
+You don't need a Rust toolchain to try it out. Just run `eprofiler-tui` with Docker or Podman:
 
 ```
 podman run -it -p 4317:4317 ghcr.io/rogercoll/eprofiler-tui:latest --data-dir /tmp
@@ -60,7 +61,7 @@ eprofiler-tui --port 4318
 
 ## Debug mode
 
-A standalone profile inspector for troubleshooting profiling pipelines. It receives OTLP profiles on a gRPC endpoint and displays each `ExportProfilesServiceRequest` as a paginated, color-coded view of the raw data — dictionary tables, resource attributes, scope metadata, profile fields, and fully resolved sample stacks.
+A standalone profile inspector for troubleshooting profiling pipelines. It receives OTLP profiles on a gRPC endpoint and displays each `ExportProfilesServiceRequest` as a paginated, color-coded view of the raw data: dictionary tables, resource attributes, scope metadata, profile fields, and fully resolved sample stacks.
 
 ```
 eprofiler-tui debug
@@ -74,7 +75,7 @@ Navigate between requests like pages in a book with `h`/`l`. Each page shows the
 | Key | Action |
 |-----|--------|
 | `h` / `←`  `l` / `→` | Previous / next request |
-| `j` / `↓`  `k` / `↑` | Scroll up / down |
+| `j` / `↓`  `k` / `↑` | Scroll down / up |
 | `d` / `u` | Page down / up |
 | `g` / `G` | Jump to first / last request |
 | `/` | Search within current request |
@@ -87,9 +88,9 @@ Requires Rust 2024 edition and protobuf definitions from the `opentelemetry-prot
 
 The symbolization feature (`symblib`) pulls in native C/C++ dependencies that need extra build tools:
 
-- `cmake` and `make` — used by the `zydis` disassembler crate
-- `g++` (or any C++ compiler) — compiles `zydis`'s bundled C sources
-- `protobuf-compiler` (`protoc`) — used by `prost-build` to compile `.proto` definitions inside `symblib`
+- `cmake` and `make`, used by the `zydis` disassembler crate
+- `g++` (or any C++ compiler) to build the C sources bundled with `zydis`
+- `protobuf-compiler` (`protoc`), used by `prost-build` to compile `.proto` definitions inside `symblib`
 
 ```
 git submodule update --init
@@ -107,15 +108,26 @@ cargo build --release
 | `f` / `Space` | Toggle freeze/live mode |
 | `j` / `↓`  `k` / `↑` | Navigate depth |
 | `h` / `←`  `l` / `→` | Navigate siblings |
-| `Enter` / `Esc` | Zoom in / out |
+| `Enter` / `Esc` (or `Backspace`) | Zoom in / out |
 | `/` | Search threads |
 | `r` | Reset |
 
-**Executables tab** *(experimental — under testing, may be removed for simplification)*
+**Flamescope tab** *(experimental)*
 
 | Key | Action |
 |-----|--------|
-| `j` / `k` | Navigate list |
+| `h` / `←`  `l` / `→` | Move between columns (pauses auto-scroll) |
+| `j` / `↓`  `k` / `↑` | Move between rows |
+| `G` / `End` | Resume auto-scroll |
+| `/` | Filter by thread |
+| `Esc` | Clear thread filter and resume auto-scroll |
+| `r` | Reset |
+
+**Executables tab** *(experimental, still being tested and might be removed to keep things simple)*
+
+| Key | Action |
+|-----|--------|
+| `j` / `↓`  `k` / `↑` | Navigate list |
 | `Enter` | Load symbols for selected executable |
 | `/` | Add new executable by path |
 | `r` | Remove loaded symbols |
