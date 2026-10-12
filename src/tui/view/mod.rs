@@ -99,7 +99,7 @@ pub(crate) mod testing {
     };
 
     use super::Screen;
-    use crate::flamegraph::SampledStack;
+    use crate::flamegraph::{SampledStack, TypedStacks};
     use crate::tui::event::Event;
     use crate::tui::state::State;
 
@@ -111,11 +111,13 @@ pub(crate) mod testing {
     pub fn populated_state() -> State {
         let mut state = State::new("0.0.0.0:4317".into(), vec![]);
         state.handle_event(Event::ProfileUpdate {
-            stacks: vec![
-                SampledStack::from_names(&["worker-1", "main", "do_work"], 30),
-                SampledStack::from_names(&["worker-2", "main"], 10),
-            ],
-            samples: 40,
+            profiles: vec![TypedStacks::cpu(
+                vec![
+                    SampledStack::from_names(&["worker-1", "main", "do_work"], 30),
+                    SampledStack::from_names(&["worker-2", "main"], 10),
+                ],
+                40,
+            )],
             timestamps: HashMap::from([("worker-1".into(), vec![0u64, 1_500_000_000])]),
         });
         state.handle_event(Event::MappingsDiscovered(vec![

@@ -90,6 +90,44 @@ impl SampledStack {
     }
 }
 
+/// What a profile's values measure, e.g. samples/count or gpu_time/nanoseconds.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SampleType {
+    pub name: Arc<str>,
+    pub unit: Arc<str>,
+}
+
+impl SampleType {
+    /// CPU samples; also used for profiles that declare no sample type.
+    pub fn cpu() -> Self {
+        Self {
+            name: "samples".into(),
+            unit: "count".into(),
+        }
+    }
+}
+
+/// One sample type's stacks from a request.
+#[derive(Debug)]
+pub struct TypedStacks {
+    pub sample_type: SampleType,
+    pub stacks: Vec<SampledStack>,
+    /// Total weight across `stacks`.
+    pub samples: u64,
+}
+
+#[cfg(test)]
+impl TypedStacks {
+    /// CPU sample stacks.
+    pub fn cpu(stacks: Vec<SampledStack>, samples: u64) -> Self {
+        Self {
+            sample_type: SampleType::cpu(),
+            stacks,
+            samples,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct FlameGraph {
     nodes: Vec<FlameNode>,

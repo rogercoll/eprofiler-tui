@@ -1,6 +1,6 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
-use crate::flamegraph::{FlameGraph, FlameNode, NodeId, SampledStack};
+use crate::flamegraph::{FlameGraph, FlameNode, NodeId, SampleType, SampledStack, TypedStacks};
 use crate::tui::theme;
 use crate::tui::widgets::{Picker, PickerEvent, PickerStyle};
 
@@ -27,10 +27,15 @@ pub struct Selected<'a> {
 }
 
 pub struct FlamegraphTab {
+    /// The shown graph, of `sample_type`.
     pub graph: FlameGraph,
+    pub sample_type: Option<SampleType>,
     pub frozen: bool,
     pub profiles_received: u64,
+    /// Weight received for `sample_type`.
     pub samples_received: u64,
+    /// The other sample types' graphs and weights, switched in with `t`.
+    others: Vec<(SampleType, FlameGraph, u64)>,
     /// First visible depth row.
     pub scroll_y: usize,
     /// Top of the visible subtree.
@@ -45,9 +50,11 @@ impl Default for FlamegraphTab {
     fn default() -> Self {
         Self {
             graph: FlameGraph::new(),
+            sample_type: None,
             frozen: false,
             profiles_received: 0,
             samples_received: 0,
+            others: Vec::new(),
             scroll_y: 0,
             zoom: FlameGraph::ROOT,
             cursor: FlameGraph::ROOT,
@@ -57,16 +64,50 @@ impl Default for FlamegraphTab {
 }
 
 impl FlamegraphTab {
-    /// Add one profile's stacks, unless frozen.
-    pub fn ingest(&mut self, stacks: &[SampledStack], samples: u64) {
+    /// Add one request's profiles to their sample type's graph, unless frozen.
+    pub fn ingest(&mut self, profiles: &[TypedStacks]) {
         if self.frozen {
             return;
         }
-        for stack in stacks {
-            self.graph.add_stack(&stack.frames, stack.weight);
+        for p in profiles {
+            // The first sample type seen is shown
+            let shown = self
+                .sample_type
+                .get_or_insert_with(|| p.sample_type.clone());
+            if *shown == p.sample_type {
+                add_stacks(&mut self.graph, &p.stacks);
+                self.samples_received += p.samples;
+                continue;
+            }
+            let other = match self.others.iter().position(|(t, ..)| *t == p.sample_type) {
+                Some(i) => &mut self.others[i],
+                None => {
+                    self.others
+                        .push((p.sample_type.clone(), FlameGraph::new(), 0));
+                    self.others.last_mut().expect("just pushed")
+                }
+            };
+            add_stacks(&mut other.1, &p.stacks);
+            other.2 += p.samples;
         }
         self.profiles_received += 1;
-        self.samples_received += samples;
+    }
+
+    /// Show the next sample type's graph (`t`); the view starts at its root.
+    fn next_sample_type(&mut self) {
+        if self.others.is_empty() {
+            return;
+        }
+        let (sample_type, graph, samples) = self.others.remove(0);
+        let shown_type = self.sample_type.replace(sample_type);
+        let shown_graph = std::mem::replace(&mut self.graph, graph);
+        let shown_samples = std::mem::replace(&mut self.samples_received, samples);
+        if let Some(shown_type) = shown_type {
+            self.others.push((shown_type, shown_graph, shown_samples));
+        }
+        self.scroll_y = 0;
+        self.zoom = FlameGraph::ROOT;
+        self.cursor = FlameGraph::ROOT;
     }
 
     pub fn zoom_root(&self) -> &FlameNode {
@@ -98,6 +139,7 @@ impl FlamegraphTab {
             KeyCode::Enter => self.zoom_in(),
             KeyCode::Esc | KeyCode::Backspace => self.zoom_out(),
             KeyCode::Char('r') => self.reset(),
+            KeyCode::Char('t') => self.next_sample_type(),
             KeyCode::Char('/') => self.open_search(),
             _ => {}
         };
@@ -194,5 +236,11 @@ impl FlamegraphTab {
             frozen: self.frozen,
             ..Self::default()
         };
+    }
+}
+
+fn add_stacks(graph: &mut FlameGraph, stacks: &[SampledStack]) {
+    for stack in stacks {
+        graph.add_stack(&stack.frames, stack.weight);
     }
 }

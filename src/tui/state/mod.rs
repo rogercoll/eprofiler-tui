@@ -77,14 +77,13 @@ impl State {
             Event::Tick | Event::Resize => None,
             Event::Key(key) => self.handle_key(key),
             Event::ProfileUpdate {
-                stacks,
-                samples,
+                profiles,
                 timestamps,
             } => {
                 if !self.fg.frozen {
                     self.fs.record_timestamps(&timestamps);
                 }
-                self.fg.ingest(&stacks, samples);
+                self.fg.ingest(&profiles);
                 None
             }
             Event::MappingsDiscovered(names) => {
@@ -138,7 +137,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::flamegraph::SampledStack;
+    use crate::flamegraph::{FlameGraph, SampleType, SampledStack, TypedStacks};
 
     fn key(code: KeyCode) -> Event {
         Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
@@ -154,11 +153,13 @@ mod tests {
         let mut state = State::new("addr".into(), vec![]);
         let timestamps = HashMap::from([("worker-1".into(), vec![0u64])]);
         state.handle_event(Event::ProfileUpdate {
-            stacks: vec![
-                SampledStack::from_names(&["worker-1", "main"], 5),
-                SampledStack::from_names(&["other", "main"], 5),
-            ],
-            samples: 10,
+            profiles: vec![TypedStacks::cpu(
+                vec![
+                    SampledStack::from_names(&["worker-1", "main"], 5),
+                    SampledStack::from_names(&["other", "main"], 5),
+                ],
+                10,
+            )],
             timestamps,
         });
         state.handle_event(Event::MappingsDiscovered(vec!["app".into()]));
@@ -274,5 +275,47 @@ mod tests {
         press(&mut state, KeyCode::Esc);
         assert_eq!(&*state.fg.zoom_root().name, "all");
         assert_eq!(name(&state), "all");
+    }
+
+    #[test]
+    fn t_switches_between_sample_types() {
+        let mut state = State::new("addr".into(), vec![]);
+        let gpu_time = SampleType {
+            name: "gpu_time".into(),
+            unit: "nanoseconds".into(),
+        };
+        state.handle_event(Event::ProfileUpdate {
+            profiles: vec![
+                TypedStacks::cpu(vec![SampledStack::from_names(&["cpu-thread"], 3)], 3),
+                TypedStacks {
+                    sample_type: gpu_time.clone(),
+                    stacks: vec![SampledStack::from_names(&["gpu-thread"], 51_000)],
+                    samples: 51_000,
+                },
+            ],
+            timestamps: HashMap::new(),
+        });
+        let first_thread = |state: &State| {
+            let graph = &state.fg.graph;
+            graph[graph[FlameGraph::ROOT].children[0]].name.to_string()
+        };
+
+        // The first sample type received is shown
+        assert_eq!(state.fg.sample_type, Some(SampleType::cpu()));
+        assert_eq!(
+            (first_thread(&state).as_str(), state.fg.samples_received),
+            ("cpu-thread", 3)
+        );
+
+        state.handle_event(key(KeyCode::Char('t')));
+        assert_eq!(state.fg.sample_type, Some(gpu_time));
+        assert_eq!(
+            (first_thread(&state).as_str(), state.fg.samples_received),
+            ("gpu-thread", 51_000)
+        );
+
+        state.handle_event(key(KeyCode::Char('t')));
+        assert_eq!(state.fg.sample_type, Some(SampleType::cpu()));
+        assert_eq!(first_thread(&state), "cpu-thread");
     }
 }

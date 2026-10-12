@@ -54,8 +54,7 @@ impl ProfilesServer {
                 let _ = events.send(Event::MappingsDiscovered(batch.new_mappings));
             }
             let _ = events.send(Event::ProfileUpdate {
-                stacks: batch.stacks,
-                samples: batch.samples,
+                profiles: batch.profiles,
                 timestamps: batch.timestamps,
             });
         });
@@ -79,6 +78,8 @@ impl collector::profiles_service_server::ProfilesService for ProfilesServer {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    use crate::flamegraph::TypedStacks;
 
     use crate::frame::{FrameKind, Runtime};
     use eprofiler_proto::opentelemetry::proto::common::v1 as common;
@@ -202,11 +203,18 @@ mod tests {
         let event = rx.recv_timeout(Duration::from_secs(2)).unwrap();
         match event {
             Event::ProfileUpdate {
-                stacks,
-                samples,
+                profiles,
                 timestamps,
             } => {
-                assert_eq!(samples, 10);
+                let [
+                    TypedStacks {
+                        stacks, samples, ..
+                    },
+                ] = profiles.as_slice()
+                else {
+                    panic!("expected one sample type, got {}", profiles.len());
+                };
+                assert_eq!(*samples, 10);
                 assert!(timestamps.is_empty());
                 let [stack] = stacks.as_slice() else {
                     panic!("expected one stack, got {stacks:?}");
@@ -224,7 +232,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_export_timestamps_take_priority() {
+    async fn test_export_values_weight_timestamped_samples() {
         let (tx, rx) = mpsc::channel();
         let port = setup_server(tx).await;
 
@@ -232,9 +240,10 @@ mod tests {
             .await
             .unwrap();
 
+        // One value per timestamp, e.g. off-CPU or GPU nanoseconds
         let sample = Sample {
             stack_index: 1,
-            values: vec![1],
+            values: vec![10, 20, 30, 40, 50],
             timestamps_unix_nano: vec![100, 200, 300, 400, 500],
             attribute_indices: vec![1],
             ..Default::default()
@@ -258,11 +267,75 @@ mod tests {
         let event = rx.recv_timeout(Duration::from_secs(2)).unwrap();
         match event {
             Event::ProfileUpdate {
-                stacks,
-                samples,
+                profiles,
                 timestamps,
             } => {
-                assert_eq!(samples, 5);
+                let [
+                    TypedStacks {
+                        stacks, samples, ..
+                    },
+                ] = profiles.as_slice()
+                else {
+                    panic!("expected one sample type, got {}", profiles.len());
+                };
+                assert_eq!(*samples, 150);
+                assert_eq!(
+                    timestamps.get("[unknown]").unwrap(),
+                    &vec![100, 200, 300, 400, 500]
+                );
+                assert_eq!(stacks[0].weight, 150);
+            }
+            _ => panic!("expected ProfileUpdate event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_export_timestamps_without_values() {
+        let (tx, rx) = mpsc::channel();
+        let port = setup_server(tx).await;
+
+        let mut client = ProfilesServiceClient::connect(format!("http://127.0.0.1:{port}"))
+            .await
+            .unwrap();
+
+        // Each timestamp is one event, e.g. CPU samples
+        let sample = Sample {
+            stack_index: 1,
+            timestamps_unix_nano: vec![100, 200, 300, 400, 500],
+            attribute_indices: vec![1],
+            ..Default::default()
+        };
+        let req = ExportProfilesServiceRequest {
+            dictionary: Some(build_dictionary()),
+            resource_profiles: vec![ResourceProfiles {
+                scope_profiles: vec![ScopeProfiles {
+                    profiles: vec![Profile {
+                        samples: vec![sample],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        client.export(req).await.unwrap();
+
+        let event = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        match event {
+            Event::ProfileUpdate {
+                profiles,
+                timestamps,
+            } => {
+                let [
+                    TypedStacks {
+                        stacks, samples, ..
+                    },
+                ] = profiles.as_slice()
+                else {
+                    panic!("expected one sample type, got {}", profiles.len());
+                };
+                assert_eq!(*samples, 5);
                 assert_eq!(
                     timestamps.get("[unknown]").unwrap(),
                     &vec![100, 200, 300, 400, 500]

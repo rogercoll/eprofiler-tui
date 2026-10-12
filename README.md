@@ -111,6 +111,7 @@ cargo build --release
 | `Enter` / `Esc` (or `Backspace`) | Zoom in / out |
 | `/` | Search threads |
 | `r` | Reset |
+| `t` | Switch sample type (e.g. CPU samples, GPU time) |
 
 **Flamescope tab** *(experimental)*
 

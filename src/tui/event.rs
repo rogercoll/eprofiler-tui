@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::error::Result;
-use crate::flamegraph::SampledStack;
+use crate::flamegraph::TypedStacks;
 use crate::storage::ExecutableInfo;
 
 pub enum Event {
@@ -17,8 +17,7 @@ pub enum Event {
     Key(KeyEvent),
     Resize,
     ProfileUpdate {
-        stacks: Vec<SampledStack>,
-        samples: u64,
+        profiles: Vec<TypedStacks>,
         timestamps: HashMap<Arc<str>, Vec<u64>>,
     },
     MappingsDiscovered(Vec<String>),

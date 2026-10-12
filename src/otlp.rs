@@ -7,16 +7,14 @@ use eprofiler_proto::opentelemetry::proto::collector::profiles::v1development::E
 use eprofiler_proto::opentelemetry::proto::common::v1 as common;
 use eprofiler_proto::opentelemetry::proto::profiles::v1development as profiles;
 
-use crate::flamegraph::SampledStack;
+use crate::flamegraph::{SampleType, SampledStack, TypedStacks};
 use crate::frame::{Frame, FrameInfo, FrameKind, Runtime};
 use crate::storage::SymbolStore;
 
 /// Everything one export request contributes to the UI.
 pub struct ProfileBatch {
-    /// Each distinct stack in the request, once, with its summed weight.
-    pub stacks: Vec<SampledStack>,
-    /// Total weight across `stacks`.
-    pub samples: u64,
+    /// Per sample type, each distinct stack once with its summed weight.
+    pub profiles: Vec<TypedStacks>,
     /// Sample timestamps per process, for the flamescope.
     pub timestamps: HashMap<Arc<str>, Vec<u64>>,
     /// Basenames of executables seen for the first time.
@@ -64,53 +62,71 @@ impl<'a> Decoder<'a> {
         let locations = decoder.resolve_locations();
 
         let mut batch = ProfileBatch {
-            stacks: Vec::new(),
-            samples: 0,
+            profiles: Vec::new(),
             timestamps: HashMap::new(),
             new_mappings: known.record(decoder.dict.mapping_paths()),
         };
-        // Position in `batch.stacks` per stack, process and thread; `None` for
-        // samples that point at no stack. The dictionary is shared by every
-        // process in the request and the thread comes from each sample, so
-        // the same stack index can belong to several processes and threads.
-        let mut slots: HashMap<(i32, &str, &str), Option<usize>> = HashMap::new();
+        // Position in `batch.profiles` per sample type.
+        let mut types: HashMap<SampleType, usize> = HashMap::new();
+        // Position in its profile's stacks per sample type, stack, process
+        // and thread; `None` for samples that point at no stack. The
+        // dictionary is shared by every process in the request and the thread
+        // comes from each sample, so the same stack index can belong to
+        // several processes and threads.
+        let mut slots: HashMap<(usize, i32, &str, &str), Option<usize>> = HashMap::new();
 
         // The agent sends one resource per process.
-        let samples = req.resource_profiles.iter().flat_map(|rp| {
+        for rp in &req.resource_profiles {
             let process = decoder.process_label(rp, &locations);
-            Self::samples_of(rp).map(move |sample| (process, sample))
-        });
-        for (process, sample) in samples {
-            let thread = decoder.dict.thread_name(sample);
-            let slot = *slots
-                .entry((sample.stack_index, process, thread))
-                .or_insert_with(|| {
-                    let frames = decoder.stack(process, thread, sample, &locations);
-                    (!frames.is_empty()).then(|| {
-                        batch.stacks.push(SampledStack { frames, weight: 0 });
-                        batch.stacks.len() - 1
-                    })
+            for profile in rp.scope_profiles.iter().flat_map(|sp| &sp.profiles) {
+                let sample_type = decoder.dict.sample_type(profile);
+                let ty = *types.entry(sample_type).or_insert_with_key(|sample_type| {
+                    batch.profiles.push(TypedStacks {
+                        sample_type: sample_type.clone(),
+                        stacks: Vec::new(),
+                        samples: 0,
+                    });
+                    batch.profiles.len() - 1
                 });
-            let Some(slot) = slot else {
-                continue;
-            };
-            let stack = &mut batch.stacks[slot];
+                let typed = &mut batch.profiles[ty];
 
-            let value = if !sample.timestamps_unix_nano.is_empty() {
-                batch
-                    .timestamps
-                    .entry(Arc::clone(&stack.frames[0].name))
-                    .or_default()
-                    .extend_from_slice(&sample.timestamps_unix_nano);
-                sample.timestamps_unix_nano.len() as i64
-            } else if !sample.values.is_empty() {
-                sample.values.iter().sum::<i64>().max(1)
-            } else {
-                1
-            };
+                for sample in &profile.samples {
+                    let thread = decoder.dict.thread_name(sample);
+                    let slot = *slots
+                        .entry((ty, sample.stack_index, process, thread))
+                        .or_insert_with(|| {
+                            let frames = decoder.stack(process, thread, sample, &locations);
+                            (!frames.is_empty()).then(|| {
+                                typed.stacks.push(SampledStack { frames, weight: 0 });
+                                typed.stacks.len() - 1
+                            })
+                        });
+                    let Some(slot) = slot else {
+                        continue;
+                    };
+                    let stack = &mut typed.stacks[slot];
 
-            stack.weight += value;
-            batch.samples += value as u64;
+                    if !sample.timestamps_unix_nano.is_empty() {
+                        batch
+                            .timestamps
+                            .entry(Arc::clone(&stack.frames[0].name))
+                            .or_default()
+                            .extend_from_slice(&sample.timestamps_unix_nano);
+                    }
+                    // Values carry each event's weight (e.g. nanoseconds);
+                    // without them every timestamp is one event
+                    let value = if !sample.values.is_empty() {
+                        sample.values.iter().sum::<i64>().max(1)
+                    } else if !sample.timestamps_unix_nano.is_empty() {
+                        sample.timestamps_unix_nano.len() as i64
+                    } else {
+                        1
+                    };
+
+                    stack.weight += value;
+                    typed.samples += value as u64;
+                }
+            }
         }
         Some(batch)
     }
@@ -323,6 +339,17 @@ impl<'a> Dict<'a> {
                 _ => None,
             }
         })
+    }
+
+    /// A profile's sample type; profiles without one count as CPU samples.
+    fn sample_type(&self, profile: &profiles::Profile) -> SampleType {
+        let Some(vt) = profile.sample_type.as_ref() else {
+            return SampleType::cpu();
+        };
+        SampleType {
+            name: self.str(vt.type_strindex).unwrap_or("[unknown]").into(),
+            unit: self.str(vt.unit_strindex).unwrap_or("").into(),
+        }
     }
 
     /// Full paths of every mapping in the request.
@@ -553,7 +580,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = SymbolStore::open(tmp.path()).unwrap();
         let batch = Decoder::decode(&req, &store, &KnownMappings::default()).unwrap();
-        let stacks = batch
+        // These profiles declare no sample type, so all are CPU samples
+        let Some(profile) = batch.profiles.into_iter().next() else {
+            return (Vec::new(), 0);
+        };
+        let stacks = profile
             .stacks
             .iter()
             .map(|s| {
@@ -563,7 +594,60 @@ mod tests {
                 )
             })
             .collect();
-        (stacks, batch.samples)
+        (stacks, profile.samples)
+    }
+
+    #[test]
+    fn profiles_are_grouped_by_sample_type() {
+        let mut dict = two_stack_dictionary();
+        dict.string_table
+            .extend(["samples", "count", "gpu_time", "nanoseconds"].map(str::to_string));
+        let profile = |type_strindex, unit_strindex, stack_index, weight| profiles::Profile {
+            sample_type: Some(profiles::ValueType {
+                type_strindex,
+                unit_strindex,
+            }),
+            samples: vec![profiles::Sample {
+                stack_index,
+                values: vec![weight],
+                attribute_indices: vec![1],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let req = ExportProfilesServiceRequest {
+            dictionary: Some(dict),
+            resource_profiles: vec![profiles::ResourceProfiles {
+                scope_profiles: vec![profiles::ScopeProfiles {
+                    profiles: vec![profile(4, 5, 1, 3), profile(6, 7, 2, 51_000)],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SymbolStore::open(tmp.path()).unwrap();
+        let batch = Decoder::decode(&req, &store, &KnownMappings::default()).unwrap();
+
+        let summary: Vec<_> = batch
+            .profiles
+            .iter()
+            .map(|p| {
+                (
+                    &*p.sample_type.name,
+                    &*p.sample_type.unit,
+                    p.stacks.len(),
+                    p.samples,
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("samples", "count", 1, 3),
+                ("gpu_time", "nanoseconds", 1, 51_000)
+            ]
+        );
     }
 
     /// All `samples` from one process named `app`.

@@ -112,8 +112,7 @@ impl Report {
             report.decode += time;
             report.decode_heap += heap;
             let event = Event::ProfileUpdate {
-                stacks: batch.stacks,
-                samples: batch.samples,
+                profiles: batch.profiles,
                 timestamps: batch.timestamps,
             };
             let ((), time, heap) = measure(|| {

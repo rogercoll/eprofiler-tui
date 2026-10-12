@@ -31,6 +31,7 @@ impl TabView for FlamegraphTab {
         ("[Esc]", " back "),
         ("[/]", " search "),
         ("[r]", " reset "),
+        ("[t]", " type "),
     ];
 
     fn render_body(&mut self, area: Rect, buf: &mut Buffer) {
@@ -186,7 +187,7 @@ mod tests {
     use ratatui::crossterm::event::KeyCode;
 
     use super::*;
-    use crate::flamegraph::SampledStack;
+    use crate::flamegraph::{SampledStack, TypedStacks};
     use crate::tui::event::Event;
     use crate::tui::state::State;
     use crate::tui::view::testing::{key, populated_state, render, screen};
@@ -216,8 +217,10 @@ mod tests {
 
         // worker-2 overtakes worker-1, flipping the top-level order.
         state.handle_event(Event::ProfileUpdate {
-            stacks: vec![SampledStack::from_names(&["worker-2", "other"], 100)],
-            samples: 100,
+            profiles: vec![TypedStacks::cpu(
+                vec![SampledStack::from_names(&["worker-2", "other"], 100)],
+                100,
+            )],
             timestamps: HashMap::new(),
         });
         let graph = &state.fg.graph;
@@ -243,8 +246,10 @@ mod tests {
 
         // worker-2 overtakes worker-1 and moves to the front.
         state.handle_event(Event::ProfileUpdate {
-            stacks: vec![SampledStack::from_names(&["worker-2", "other"], 100)],
-            samples: 100,
+            profiles: vec![TypedStacks::cpu(
+                vec![SampledStack::from_names(&["worker-2", "other"], 100)],
+                100,
+            )],
             timestamps: HashMap::new(),
         });
         assert_eq!(state.fg.selected().node.position(), 0);

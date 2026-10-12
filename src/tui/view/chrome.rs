@@ -8,6 +8,7 @@ use ratatui::{
     widgets::{Tabs, Widget},
 };
 
+use crate::flamegraph::SampleType;
 use crate::tui::canvas::BufferExt;
 use crate::tui::state::{ActiveTab, State};
 use crate::tui::text::format_count;
@@ -73,10 +74,12 @@ impl Widget for Header<'_> {
                 ])
                 .group([state.listen_addr.clone().fg(theme::MUTED)])
                 .group([format!("{} profiles", state.fg.profiles_received).fg(theme::MUTED_DARK)])
-                .group([
-                    format!("{} samples", format_count(state.fg.samples_received))
-                        .fg(theme::MUTED_DARK),
-                ]),
+                .group([format!(
+                    "{} {}",
+                    format_count(state.fg.samples_received),
+                    sample_type_label(state.fg.sample_type.as_ref())
+                )
+                .fg(theme::MUTED_DARK)]),
         )
         .render(area, buf);
 
@@ -143,5 +146,15 @@ impl Widget for Placeholder<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let y = area.y + area.height / 2;
         buf.center(area, y, self.0, Style::new().fg(theme::SUBTLE).italic());
+    }
+}
+
+/// The shown sample type, with its unit unless it counts events: "samples",
+/// "gpu_time (nanoseconds)".
+fn sample_type_label(sample_type: Option<&SampleType>) -> String {
+    match sample_type {
+        None => "samples".to_string(),
+        Some(t) if t.unit.is_empty() || &*t.unit == "count" => t.name.to_string(),
+        Some(t) => format!("{} ({})", t.name, t.unit),
     }
 }
